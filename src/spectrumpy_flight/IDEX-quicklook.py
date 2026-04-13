@@ -2004,6 +2004,11 @@ class BaseDataSource(ABC):
 
         return []
 
+    def list_analysis_datasets(self) -> List[str]:
+        """Return analysis dataset names addressable via ``Analysis/<name>``."""
+
+        return []
+
     def get_packet_time_seconds(self, event: str) -> Optional[float]:
         """Return packet time for ``event`` when the source exposes it."""
 
@@ -2130,6 +2135,9 @@ class HDF5DataSource(BaseDataSource):
         group.visititems(visitor)
         rows.sort(key=lambda item: item[0])
         return rows
+
+    def list_analysis_datasets(self) -> List[str]:
+        return []
 
     def gather_fit_data(self, event: str, channel: str) -> FitData:
         data = FitData()
@@ -2357,6 +2365,9 @@ class CDFDataSource(BaseDataSource):
 
     def _analysis_dataset_names(self) -> List[str]:
         return list(self.ANALYSIS_DATASET_MAP.keys())
+
+    def list_analysis_datasets(self) -> List[str]:
+        return self._analysis_dataset_names()
 
     def _analysis_dataset(self, event: str, name: str) -> Optional[np.ndarray]:
         mapping = self.ANALYSIS_DATASET_MAP.get(name)
@@ -5398,6 +5409,92 @@ class MainWindow(QMainWindow):
 
         window.destroyed.connect(_cleanup)
 
+    def _bridge_write_dataset(self, parent: Any, dataset_path: str, values: Any) -> None:
+        if h5py is None:
+            raise RuntimeError("h5py is unavailable, so bridge datasets cannot be created.")
+
+        target_parent = parent
+        parts = [segment for segment in dataset_path.split("/") if segment]
+        if not parts:
+            return
+        for segment in parts[:-1]:
+            target_parent = target_parent.require_group(segment)
+
+        dataset_name = parts[-1]
+        if dataset_name in target_parent:
+            del target_parent[dataset_name]
+
+        normalised = _normalise_attr_value(values)
+        if isinstance(normalised, str):
+            dtype = h5py.string_dtype(encoding="utf-8")
+            target_parent.create_dataset(dataset_name, data=normalised, dtype=dtype)
+            return
+        if isinstance(normalised, bytes):
+            dtype = h5py.string_dtype(encoding="utf-8")
+            text = normalised.decode("utf-8", "ignore")
+            target_parent.create_dataset(dataset_name, data=text, dtype=dtype)
+            return
+
+        try:
+            array = np.asarray(normalised)
+        except Exception:
+            return
+
+        if array.size == 0:
+            return
+
+        if array.dtype.kind in {"U", "O"}:
+            try:
+                flattened = [str(item) for item in array.reshape(-1)]
+            except Exception:
+                return
+            dtype = h5py.string_dtype(encoding="utf-8")
+            if array.ndim == 0:
+                target_parent.create_dataset(dataset_name, data=flattened[0], dtype=dtype)
+            else:
+                target_parent.create_dataset(
+                    dataset_name,
+                    data=np.asarray(flattened, dtype=object).reshape(array.shape),
+                    dtype=dtype,
+                )
+            return
+
+        target_parent.create_dataset(dataset_name, data=array)
+
+    def _bridge_event_scalar_rows(self, event_name: str) -> List[Tuple[str, Any]]:
+        if not self._data_source:
+            return []
+
+        rows: List[Tuple[str, Any]] = []
+        seen: Set[str] = set()
+        try:
+            event_rows = self._data_source.event_metadata_rows(event_name)
+        except Exception:
+            event_rows = []
+
+        for name, value, shape_text in event_rows:
+            key = str(name)
+            if key in seen:
+                continue
+            if shape_text != "Scalar":
+                continue
+            normalised = _normalise_attr_value(value)
+            if isinstance(normalised, dict):
+                continue
+            rows.append((key, normalised))
+            seen.add(key)
+
+        packet_time = _guess_packet_time_seconds(self._data_source, event_name)
+        if packet_time is not None and "PacketTime" not in seen:
+            rows.append(("PacketTime", float(packet_time)))
+            seen.add("PacketTime")
+
+        event_time_ms = _guess_event_timestamp_ms(self._data_source, event_name)
+        if event_time_ms is not None and "EventTimestampMs" not in seen:
+            rows.append(("EventTimestampMs", float(event_time_ms)))
+
+        return rows
+
     def _build_dust_composition_bridge_file(self) -> Tuple[Any, str]:
         if h5py is None:
             raise RuntimeError("h5py is unavailable, so CDF-to-HDF5 bridging cannot be created.")
@@ -5416,6 +5513,11 @@ class MainWindow(QMainWindow):
             "Analysis/DustComposition/CombinedSignal",
             "Analysis/DustComposition/CombinedTime",
         )
+        analysis_names = []
+        try:
+            analysis_names = list(dict.fromkeys(self._data_source.list_analysis_datasets()))
+        except Exception:
+            analysis_names = []
 
         for event_name in self._events:
             event_group = bridge_h5.require_group(event_name)
@@ -5427,19 +5529,29 @@ class MainWindow(QMainWindow):
                 if values is None:
                     continue
                 try:
-                    array = np.asarray(values)
+                    self._bridge_write_dataset(event_group, dataset_path, values)
                 except Exception:
                     continue
-                if array.size == 0:
+
+            metadata_rows = self._bridge_event_scalar_rows(event_name)
+            for name, value in metadata_rows:
+                try:
+                    self._bridge_write_dataset(event_group, f"Metadata/{name}", value)
+                except Exception:
                     continue
-                target_parent = event_group
-                parts = [segment for segment in dataset_path.split("/") if segment]
-                for segment in parts[:-1]:
-                    target_parent = target_parent.require_group(segment)
-                dataset_name = parts[-1]
-                if dataset_name in target_parent:
-                    del target_parent[dataset_name]
-                target_parent.create_dataset(dataset_name, data=array)
+
+            for analysis_name in analysis_names:
+                dataset_path = f"Analysis/{analysis_name}"
+                try:
+                    values = self._data_source.get_dataset(event_name, dataset_path)
+                except Exception:
+                    continue
+                if values is None:
+                    continue
+                try:
+                    self._bridge_write_dataset(event_group, dataset_path, values)
+                except Exception:
+                    continue
 
         bridge_h5.flush()
         return bridge_h5, str(bridge_path)

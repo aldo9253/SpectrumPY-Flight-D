@@ -3786,6 +3786,7 @@ class DustCompositionWindow(QMainWindow):
         figure_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         figure_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         figure_scroll.setWidget(figure_container)
+        figure_scroll.setMinimumWidth(780)
         splitter.addWidget(figure_scroll)
 
         self.control_panel = QWidget(self)
@@ -3798,10 +3799,13 @@ class DustCompositionWindow(QMainWindow):
         control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         control_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         control_scroll.setWidget(self.control_panel)
+        control_scroll.setMinimumWidth(430)
+        control_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         splitter.addWidget(control_scroll)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        splitter.setSizes([860, 460])
 
         self._build_controls()
 
