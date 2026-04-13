@@ -4171,7 +4171,7 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(22, 22))
         tb.setMovable(False)
         tb.setFloatable(False)
-        tb.setStyleSheet("QToolBar { background-color: #ffffff; border: none; padding: 8px; spacing: 8px; }")
+        tb.setStyleSheet("QToolBar { background-color: #ffffff; border: none; padding: 4px; spacing: 6px; }")
 
         toolbar_container = QWidget(self)
         toolbar_container.setObjectName("quicklookToolbarContainer")
@@ -4262,10 +4262,10 @@ class MainWindow(QMainWindow):
         export_button_style = (
             """
             QToolButton {
-                font-size: 15px;
+                font-size: 14px;
                 font-weight: 600;
-                padding: 6px 14px;
-                border-radius: 12px;
+                padding: 4px 10px;
+                border-radius: 10px;
                 background-color: #4263eb;
                 color: #ffffff;
             }
@@ -4293,14 +4293,14 @@ class MainWindow(QMainWindow):
 
         self.dust_button = QPushButton("Dust Composition", self)
         self.dust_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.dust_button.setMinimumHeight(46)
+        self.dust_button.setMinimumHeight(34)
         self.dust_button.setStyleSheet(
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 700;
-                padding: 10px 22px;
-                border-radius: 14px;
+                padding: 5px 12px;
+                border-radius: 10px;
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                                                  stop:0 #845ef7, stop:1 #5c7cfa);
                 color: #ffffff;
@@ -4323,14 +4323,14 @@ class MainWindow(QMainWindow):
 
         self.dust_estimator_button = QPushButton("Impact Parameters", self)
         self.dust_estimator_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.dust_estimator_button.setMinimumHeight(46)
+        self.dust_estimator_button.setMinimumHeight(34)
         self.dust_estimator_button.setStyleSheet(
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 700;
-                padding: 10px 22px;
-                border-radius: 14px;
+                padding: 5px 12px;
+                border-radius: 10px;
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                                                  stop:0 #0ca678, stop:1 #099268);
                 color: #ffffff;
@@ -4350,14 +4350,14 @@ class MainWindow(QMainWindow):
 
         self.sql_match_button = QPushButton("Accelerator Match", self)
         self.sql_match_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.sql_match_button.setMinimumHeight(46)
+        self.sql_match_button.setMinimumHeight(34)
         self.sql_match_button.setStyleSheet(
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 700;
-                padding: 10px 22px;
-                border-radius: 14px;
+                padding: 5px 12px;
+                border-radius: 10px;
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                                                  stop:0 #228be6, stop:1 #1c7ed6);
                 color: #ffffff;
@@ -4380,14 +4380,14 @@ class MainWindow(QMainWindow):
 
         self.noise_button = QPushButton("Noise Analysis", self)
         self.noise_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.noise_button.setMinimumHeight(46)
+        self.noise_button.setMinimumHeight(34)
         self.noise_button.setStyleSheet(
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 700;
-                padding: 10px 22px;
-                border-radius: 14px;
+                padding: 5px 12px;
+                border-radius: 10px;
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                                                  stop:0 #4dabf7, stop:1 #3b82f6);
                 color: #ffffff;
@@ -4429,12 +4429,12 @@ class MainWindow(QMainWindow):
 
         self.event_combo = QComboBox(self)
         self.event_combo.setMinimumWidth(220)
-        self.event_combo.setStyleSheet("font-size: 15px; min-height: 36px;")
+        self.event_combo.setStyleSheet("font-size: 15px; min-height: 30px;")
         self.event_combo.currentIndexChanged.connect(self.on_event_changed)
         tb.addWidget(self.event_combo)
 
         toolbar_container.adjustSize()
-        scroll.setMinimumHeight(tb.sizeHint().height() + 16)
+        scroll.setMinimumHeight(tb.sizeHint().height() + 8)
 
     def _setup_event_shortcuts(self) -> None:
         """Attach arrow-key shortcuts for stepping between events."""
@@ -4524,16 +4524,16 @@ class MainWindow(QMainWindow):
         channel_widget = QWidget(self)
         channel_row = QHBoxLayout(channel_widget)
         channel_row.setContentsMargins(6, 0, 0, 2)
-        channel_row.setSpacing(10)
+        channel_row.setSpacing(8)
         self.channel_buttons: Dict[str, QPushButton] = {}
 
         toggle_style = (
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 600;
-                padding: 7px 18px;
-                border-radius: 12px;
+                padding: 4px 10px;
+                border-radius: 10px;
                 background-color: #e8f0ff;
                 border: 1px solid #c3d0ff;
             }
@@ -4550,10 +4550,10 @@ class MainWindow(QMainWindow):
         primary_style = (
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 600;
-                padding: 7px 18px;
-                border-radius: 12px;
+                padding: 4px 10px;
+                border-radius: 10px;
                 background-color: #4263eb;
                 color: #ffffff;
             }
@@ -4568,7 +4568,7 @@ class MainWindow(QMainWindow):
             btn = QPushButton(name, self)
             btn.setCheckable(True)
             btn.setChecked(True)
-            btn.setMinimumHeight(42)
+            btn.setMinimumHeight(0)
             btn.setStyleSheet(toggle_style)
             btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda checked, channel=name: self.on_channel_toggled(channel, checked))
@@ -4581,12 +4581,13 @@ class MainWindow(QMainWindow):
 
         toggle_row = QHBoxLayout()
         toggle_row.setContentsMargins(6, 0, 0, 12)
-        toggle_row.setSpacing(10)
+        toggle_row.setSpacing(8)
 
         self.overlay_button = QPushButton("Overlay same time axis", self)
         self.overlay_button.setCheckable(True)
-        self.overlay_button.setMinimumHeight(42)
+        self.overlay_button.setMinimumHeight(0)
         self.overlay_button.setStyleSheet(toggle_style)
+        self.overlay_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.overlay_button.setToolTip("When enabled, channels with the same time base are drawn together.")
         self.overlay_button.clicked.connect(self.on_overlay_toggled)
         toggle_row.addWidget(self.overlay_button)
@@ -4595,8 +4596,9 @@ class MainWindow(QMainWindow):
         for channel in sorted(FIT_ELIGIBLE_CHANNELS):
             btn = QPushButton(f"Show {channel} Fit", self)
             btn.setCheckable(True)
-            btn.setMinimumHeight(42)
+            btn.setMinimumHeight(0)
             btn.setStyleSheet(toggle_style)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.setToolTip("Overlay fit curves when available.")
             btn.clicked.connect(lambda checked, chan=channel: self.on_fit_toggled(chan, checked))
             toggle_row.addWidget(btn)
@@ -4604,8 +4606,9 @@ class MainWindow(QMainWindow):
 
         self.stats_selector_button = QPushButton("Statistics Selector", self)
         self.stats_selector_button.setCheckable(True)
-        self.stats_selector_button.setMinimumHeight(42)
+        self.stats_selector_button.setMinimumHeight(0)
         self.stats_selector_button.setStyleSheet(toggle_style)
+        self.stats_selector_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.stats_selector_button.setToolTip(
             "Select a waveform region to display min/mean/max/std statistics."
         )
@@ -4613,51 +4616,21 @@ class MainWindow(QMainWindow):
         toggle_row.addWidget(self.stats_selector_button)
 
         self.edit_params_button = QPushButton("Edit Fit Parameters", self)
-        self.edit_params_button.setMinimumHeight(42)
+        self.edit_params_button.setMinimumHeight(0)
         self.edit_params_button.setStyleSheet(primary_style)
+        self.edit_params_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.edit_params_button.clicked.connect(self.open_fit_parameter_dialog)
         toggle_row.addWidget(self.edit_params_button)
 
         toggle_row.addStretch(1)
         panel_layout.addLayout(toggle_row)
 
-        self._harmonize_primary_button_widths()
-        QTimer.singleShot(0, self._harmonize_primary_button_widths)
-
         self.vbox.addWidget(panel)
 
     def _harmonize_primary_button_widths(self) -> None:
-        """Use a shared fixed size so both control rows align column-by-column."""
+        """Keep quicklook controls content-sized instead of forcing equal-width buttons."""
 
-        if not getattr(self, "_primary_channel_buttons", None):
-            return
-
-        secondary_buttons = [
-            self.edit_params_button,
-            self.overlay_button,
-            getattr(self, "stats_selector_button", None),
-            *self.fit_buttons.values(),
-        ]
-        all_buttons = [
-            *self._primary_channel_buttons,
-            *(btn for btn in secondary_buttons if btn is not None),
-        ]
-        if not all_buttons:
-            return
-
-        reference_width = max(btn.sizeHint().width() for btn in all_buttons)
-
-        if reference_width <= 0:
-            return
-
-        reference_height = max(btn.sizeHint().height() for btn in all_buttons)
-
-        for btn in all_buttons:
-            btn.setMinimumWidth(reference_width)
-            btn.setMaximumWidth(reference_width)
-            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            if reference_height > 0:
-                btn.setFixedHeight(max(btn.minimumHeight(), reference_height))
+        return
 
     def _reset_layout_engine(self) -> None:
         """Re-enable Matplotlib's constrained layout after clearing the figure."""
