@@ -161,9 +161,9 @@ try:
         QApplication, QFileDialog, QMainWindow, QMessageBox, QStatusBar, QToolBar,
         QVBoxLayout, QWidget, QComboBox, QLabel, QSizePolicy, QDialog, QPushButton,
         QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
-        QCheckBox, QDialogButtonBox, QMenu, QMenuBar, QToolButton, QTextBrowser,
+        QCheckBox, QDialogButtonBox, QMenu, QMenuBar, QToolButton, QTextBrowser, QTextEdit,
         QListWidget, QListWidgetItem, QLineEdit, QWidgetAction, QStyle, QSplitter,
-        QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox
+        QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget
     )
     _QT = "PySide6"
 except Exception:
@@ -183,9 +183,9 @@ except Exception:
         QApplication, QFileDialog, QMainWindow, QMessageBox, QStatusBar, QToolBar,
         QVBoxLayout, QWidget, QComboBox, QLabel, QSizePolicy, QDialog, QPushButton,
         QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
-        QCheckBox, QDialogButtonBox, QMenu, QMenuBar, QToolButton, QTextBrowser,
+        QCheckBox, QDialogButtonBox, QMenu, QMenuBar, QToolButton, QTextBrowser, QTextEdit,
         QListWidget, QListWidgetItem, QLineEdit, QWidgetAction, QStyle, QSplitter,
-        QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox
+        QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget
     )
     _QT = "PyQt6"
 
@@ -1406,6 +1406,44 @@ def _normalise_scalar(value: Any) -> Any:
     return value
 
 
+def _stringify_event_data_value(value: Any) -> str:
+    preview_limit = 10
+    value = _normalise_attr_value(value)
+    if isinstance(value, dict):
+        return "; ".join(
+            f"{key}={_stringify_event_data_value(item)}" for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        preview_items = list(value[:preview_limit])
+        text = ", ".join(_stringify_event_data_value(item) for item in preview_items)
+        if len(value) > preview_limit:
+            text += ", ..."
+        return text
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            return _stringify_event_data_value(value.item())
+        flat = value.reshape(-1)
+        preview = flat[:preview_limit]
+        text = np.array2string(preview, threshold=preview_limit)
+        if flat.size > preview_limit:
+            text = f"{text} ..."
+        return text
+    if isinstance(value, np.generic):
+        return _stringify_event_data_value(value.item())
+    return str(value)
+
+
+def _event_data_shape_text(value: Any) -> str:
+    value = _normalise_attr_value(value)
+    if isinstance(value, dict):
+        return "Mapping"
+    if isinstance(value, np.ndarray):
+        return "Scalar" if value.shape == () else str(tuple(value.shape))
+    if isinstance(value, (list, tuple)):
+        return str((len(value),))
+    return "Scalar"
+
+
 _AID_DATASETS = (
     "Metadata/unpacked/IDX__SCI0AID",
     "Metadata/unpacked/SCI0AID",
@@ -1553,6 +1591,7 @@ FAMILY_UNITS = {
     FAMILY_LOW: "pC",
 }
 
+SUMMARY_EPOCH_REFERENCE = datetime(2010, 1, 1, tzinfo=timezone.utc)
 TIME_AXIS_LABEL = r"Time [$\mu$s]"
 MASS_AXIS_LABEL = "Mass [amu]"
 MASS_ATTRIBUTE_GROUPS: Tuple[str, ...] = (
@@ -1804,6 +1843,115 @@ class FitData:
             yield path, np.asarray(values)
 
 
+class EventDataDialog(QDialog):
+    """Tabbed viewer for the currently selected event's metadata and datasets."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        summary_text: str,
+        global_attributes: Dict[str, Any],
+        event_attributes: List[Tuple[str, str, Any]],
+        event_metadata: List[Tuple[str, Any, str]],
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Event Data")
+        self.resize(1040, 760)
+        self.setModal(False)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+
+        layout = QVBoxLayout(self)
+        self._tabs = QTabWidget(self)
+        layout.addWidget(self._tabs)
+
+        summary_tab = QWidget(self)
+        summary_layout = QVBoxLayout(summary_tab)
+        self._summary_box = QTextEdit(summary_tab)
+        self._summary_box.setReadOnly(True)
+        summary_layout.addWidget(self._summary_box)
+        self._tabs.addTab(summary_tab, "Summary")
+
+        self._attrs_table = QTableWidget(self)
+        self._attrs_table.setColumnCount(2)
+        self._attrs_table.setHorizontalHeaderLabels(["Attribute", "Value"])
+        self._attrs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._attrs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._tabs.addTab(self._attrs_table, "Global Attributes")
+
+        self._event_attrs_table = QTableWidget(self)
+        self._event_attrs_table.setColumnCount(3)
+        self._event_attrs_table.setHorizontalHeaderLabels(["Object", "Attribute", "Value"])
+        self._event_attrs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._event_attrs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._event_attrs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._tabs.addTab(self._event_attrs_table, "Event Attributes")
+
+        self._event_table = QTableWidget(self)
+        self._event_table.setColumnCount(3)
+        self._event_table.setHorizontalHeaderLabels(["Variable", "Value", "Shape"])
+        self._event_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._event_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._event_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._tabs.addTab(self._event_table, "Current Event")
+
+        btn_close = QPushButton("Close", self)
+        btn_close.clicked.connect(self.hide)
+        layout.addWidget(btn_close)
+
+        self.update_contents(
+            summary_text=summary_text,
+            global_attributes=global_attributes,
+            event_attributes=event_attributes,
+            event_metadata=event_metadata,
+        )
+
+    def update_contents(
+        self,
+        *,
+        summary_text: str,
+        global_attributes: Dict[str, Any],
+        event_attributes: List[Tuple[str, str, Any]],
+        event_metadata: List[Tuple[str, Any, str]],
+    ) -> None:
+        self._summary_box.setPlainText(summary_text)
+        self._populate_table(
+            self._attrs_table,
+            [
+                (str(key), _stringify_event_data_value(global_attributes[key]))
+                for key in sorted(global_attributes)
+            ],
+        )
+        event_attrs_index = self._tabs.indexOf(self._event_attrs_table)
+        if event_attributes:
+            if event_attrs_index < 0:
+                self._tabs.insertTab(2, self._event_attrs_table, "Event Attributes")
+            self._populate_table(
+                self._event_attrs_table,
+                [
+                    (path, name, _stringify_event_data_value(value))
+                    for path, name, value in event_attributes
+                ],
+            )
+        elif event_attrs_index >= 0:
+            self._tabs.removeTab(event_attrs_index)
+        self._populate_table(
+            self._event_table,
+            [
+                (name, _stringify_event_data_value(value), shape_text)
+                for name, value, shape_text in event_metadata
+            ],
+        )
+
+    @staticmethod
+    def _populate_table(table: QTableWidget, rows: List[Tuple[Any, ...]]) -> None:
+        table.setRowCount(len(rows))
+        for row_index, row_values in enumerate(rows):
+            for col_index, value in enumerate(row_values):
+                table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
+        table.resizeRowsToContents()
+
+
 class BaseDataSource(ABC):
     """Abstract data provider used by the quicklook controller."""
 
@@ -1840,6 +1988,26 @@ class BaseDataSource(ABC):
         """Return attribute mapping for the event group (default: empty)."""
 
         return {}
+
+    def get_global_attributes(self) -> Dict[str, Any]:
+        """Return file-level attributes for the loaded source (default: empty)."""
+
+        return {}
+
+    def event_attribute_rows(self, event: str) -> List[Tuple[str, str, Any]]:
+        """Return event-scoped object attributes as ``(path, key, value)`` rows."""
+
+        return []
+
+    def event_metadata_rows(self, event: str) -> List[Tuple[str, Any, str]]:
+        """Return event-scoped datasets as ``(name, value, shape_text)`` rows."""
+
+        return []
+
+    def get_packet_time_seconds(self, event: str) -> Optional[float]:
+        """Return packet time for ``event`` when the source exposes it."""
+
+        return None
 
     def describe(self) -> str:
         return os.path.basename(self.filename)
@@ -1913,6 +2081,55 @@ class HDF5DataSource(BaseDataSource):
         for key, value in obj.attrs.items():
             result[key] = _normalise_attr_value(value)
         return result
+
+    def get_global_attributes(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in self._file.attrs.items():
+            result[str(key)] = _normalise_attr_value(value)
+        return result
+
+    def event_attribute_rows(self, event: str) -> List[Tuple[str, str, Any]]:
+        group = self._file.get(str(event))
+        if not isinstance(group, h5py.Group):
+            return []
+
+        rows: List[Tuple[str, str, Any]] = []
+
+        def _append_attrs(path: str, obj: Any) -> None:
+            attrs = getattr(obj, "attrs", None)
+            if attrs is None:
+                return
+            for key, value in attrs.items():
+                rows.append((path, str(key), _normalise_attr_value(value)))
+
+        _append_attrs(".", group)
+
+        def visitor(name: str, obj: Any) -> None:
+            _append_attrs(name, obj)
+
+        group.visititems(visitor)
+        rows.sort(key=lambda item: (item[0], item[1]))
+        return rows
+
+    def event_metadata_rows(self, event: str) -> List[Tuple[str, Any, str]]:
+        group = self._file.get(str(event))
+        if not isinstance(group, h5py.Group):
+            return []
+
+        rows: List[Tuple[str, Any, str]] = []
+
+        def visitor(name: str, obj: Any) -> None:
+            if not isinstance(obj, h5py.Dataset):
+                return
+            try:
+                value = np.array(obj[()], copy=True)
+            except Exception:
+                return
+            rows.append((name, _normalise_attr_value(value), _event_data_shape_text(value)))
+
+        group.visititems(visitor)
+        rows.sort(key=lambda item: item[0])
+        return rows
 
     def gather_fit_data(self, event: str, channel: str) -> FitData:
         data = FitData()
@@ -2085,6 +2302,26 @@ class CDFDataSource(BaseDataSource):
         except Exception:
             return np.asarray([])
 
+    def _event_scalar(self, event: str, candidates: Tuple[str, ...]) -> Optional[float]:
+        index = self._event_index(event)
+        for name in candidates:
+            data = self._cached_variable(name)
+            if data.size == 0:
+                continue
+            try:
+                if data.ndim >= 1 and data.shape[0] == self._event_count:
+                    value = np.asarray(data[index]).reshape(-1)[0]
+                elif data.ndim == 0:
+                    value = data.item()
+                else:
+                    continue
+                value_f = float(value)
+            except Exception:
+                continue
+            if np.isfinite(value_f):
+                return value_f
+        return None
+
     def _resolve_epoch_seconds(self) -> Optional[np.ndarray]:
         try:
             raw = self._cdf.varget("epoch")
@@ -2182,6 +2419,71 @@ class CDFDataSource(BaseDataSource):
         except Exception:
             return None
         return np.array(slice_data, copy=True)
+
+    def get_global_attributes(self) -> Dict[str, Any]:
+        try:
+            attrs = self._cdf.globalattsget(expand=True) or {}
+        except Exception:
+            try:
+                attrs = self._cdf.globalattsget() or {}
+            except Exception:
+                attrs = {}
+
+        if not isinstance(attrs, dict):
+            try:
+                attrs = dict(attrs)
+            except Exception:
+                return {}
+
+        return {str(key): _normalise_attr_value(value) for key, value in attrs.items()}
+
+    def get_packet_time_seconds(self, event: str) -> Optional[float]:
+        coarse = self._event_scalar(event, ("SHCOARSE", "shcoarse"))
+        fine = self._event_scalar(event, ("SHFINE", "shfine"))
+        if coarse is None or fine is None:
+            return None
+        return float(coarse) + 20.0e-6 * float(fine)
+
+    def event_metadata_rows(self, event: str) -> List[Tuple[str, Any, str]]:
+        try:
+            info = self._cdf.cdf_info()
+        except Exception:
+            return []
+
+        variable_names: List[str] = []
+        for key in ("zVariables", "rVariables"):
+            values = info.get(key, []) if isinstance(info, dict) else getattr(info, key, [])
+            for name in values or []:
+                variable_names.append(str(name))
+
+        rows: List[Tuple[str, Any, str]] = []
+        index = self._event_index(event)
+        for name in sorted(set(variable_names)):
+            data = self._cached_variable(name)
+            if data.size == 0:
+                continue
+
+            try:
+                if data.ndim >= 1 and data.shape[0] == self._event_count:
+                    value = np.array(data[index], copy=True)
+                elif data.ndim == 0:
+                    value = data.item()
+                else:
+                    value = np.array(data, copy=True)
+            except Exception:
+                continue
+
+            rows.append((name, _normalise_attr_value(value), _event_data_shape_text(value)))
+
+        epoch_seconds = self.get_epoch_seconds(event)
+        if epoch_seconds is not None:
+            try:
+                epoch_text = datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).isoformat()
+            except Exception:
+                epoch_text = str(epoch_seconds)
+            rows.insert(0, ("event_epoch_utc", epoch_text, "Scalar"))
+
+        return rows
 
     def iter_analysis_datasets(self, event: str) -> Dict[str, np.ndarray]:
         datasets: Dict[str, np.ndarray] = {}
@@ -2459,6 +2761,60 @@ _TRIGGER_MODE_DATASETS: Tuple[str, ...] = (
     "Metadata/unpacked/TriggerMode",
     "Metadata/unpacked/TriggerType",
 )
+
+_PACKET_TIME_COARSE_DATASETS: Tuple[str, ...] = (
+    "Metadata/SHCOARSE",
+    "Metadata/unpacked/SHCOARSE",
+    "Metadata/raw/SHCOARSE",
+    "SHCOARSE",
+)
+
+_PACKET_TIME_FINE_DATASETS: Tuple[str, ...] = (
+    "Metadata/SHFINE",
+    "Metadata/unpacked/SHFINE",
+    "Metadata/raw/SHFINE",
+    "SHFINE",
+)
+
+
+def _guess_packet_time_seconds(data_source: BaseDataSource, event: str) -> Optional[float]:
+    getter = getattr(data_source, "get_packet_time_seconds", None)
+    if callable(getter):
+        try:
+            packet_time = getter(event)
+        except Exception:
+            packet_time = None
+        if packet_time is not None:
+            try:
+                return float(packet_time)
+            except Exception:
+                pass
+
+    coarse = None
+    for dataset in _PACKET_TIME_COARSE_DATASETS:
+        coarse = _get_dataset_scalar(data_source, event, dataset)
+        if coarse is not None:
+            break
+
+    fine = None
+    for dataset in _PACKET_TIME_FINE_DATASETS:
+        fine = _get_dataset_scalar(data_source, event, dataset)
+        if fine is not None:
+            break
+
+    if coarse is None or fine is None:
+        return None
+    return float(coarse) + 20.0e-6 * float(fine)
+
+
+def _packet_time_utc_text(data_source: BaseDataSource, event: str) -> Optional[str]:
+    packet_time = _guess_packet_time_seconds(data_source, event)
+    if packet_time is None:
+        return None
+    try:
+        return (SUMMARY_EPOCH_REFERENCE + timedelta(seconds=float(packet_time))).isoformat(timespec="microseconds")
+    except Exception:
+        return None
 
 
 def _guess_event_timestamp_ms(data_source: BaseDataSource, event: str) -> Optional[float]:
@@ -3875,6 +4231,7 @@ class MainWindow(QMainWindow):
         self._child_windows: List[QWidget] = []
         self._dust_bridge_files: Dict[int, Tuple[Any, str]] = {}
         self._documentation_center: Optional[DocumentationCenter] = None
+        self._event_data_dialog: Optional[EventDataDialog] = None
 
         self._create_actions()
 
@@ -3916,6 +4273,44 @@ class MainWindow(QMainWindow):
             """
             QScrollArea { border: none; background: transparent; }
             QScrollArea > QWidget > QWidget { background: transparent; }
+            QScrollBar:vertical {
+                background: #d9dee8;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #5f6368;
+                min-height: 28px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #4b4f54;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            QScrollBar:horizontal {
+                background: #d9dee8;
+                height: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #5f6368;
+                min-width: 28px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #4b4f54;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: transparent;
+            }
             """
         )
         self.scroll_area.setWidget(self._plot_container)
@@ -4003,6 +4398,10 @@ class MainWindow(QMainWindow):
         self.view_structure_action = QAction("Open Data Browser", self)
         self.view_structure_action.setShortcut("Ctrl+B")
         self.view_structure_action.triggered.connect(self.action_view_structure)
+
+        self.event_data_action = QAction("Event Data", self)
+        self.event_data_action.setStatusTip("View all datasets and attributes for the current event")
+        self.event_data_action.triggered.connect(self.action_open_event_data)
 
         self.open_hdf_explorer_action = QAction("Open HDF Explorer", self)
         self.open_hdf_explorer_action.setShortcut("Ctrl+Shift+H")
@@ -4105,6 +4504,7 @@ class MainWindow(QMainWindow):
 
         view_menu = menubar.addMenu("&View")
         view_menu.addAction(self.view_structure_action)
+        view_menu.addAction(self.event_data_action)
         view_menu.addAction(self.open_hdf_explorer_action)
         view_menu.addAction(self.open_variable_definitions_action)
         view_menu.addAction(self.open_dust_estimator_action)
@@ -4134,7 +4534,7 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(22, 22))
         tb.setMovable(False)
         tb.setFloatable(False)
-        tb.setStyleSheet("QToolBar { background-color: #ffffff; border: none; padding: 8px; spacing: 8px; }")
+        tb.setStyleSheet("QToolBar { background-color: #ffffff; border: none; padding: 4px; spacing: 6px; }")
 
         toolbar_container = QWidget(self)
         toolbar_container.setObjectName("quicklookToolbarContainer")
@@ -4165,6 +4565,44 @@ class MainWindow(QMainWindow):
             QScrollArea#quicklookToolbarScrollArea > QWidget > QWidget {
                 background-color: #ffffff;
             }
+            QScrollBar:vertical {
+                background: #d9dee8;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #5f6368;
+                min-height: 28px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #4b4f54;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            QScrollBar:horizontal {
+                background: #d9dee8;
+                height: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #5f6368;
+                min-width: 28px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #4b4f54;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: transparent;
+            }
             """
         )
 
@@ -4187,10 +4625,10 @@ class MainWindow(QMainWindow):
         export_button_style = (
             """
             QToolButton {
-                font-size: 15px;
+                font-size: 14px;
                 font-weight: 600;
-                padding: 6px 14px;
-                border-radius: 12px;
+                padding: 4px 10px;
+                border-radius: 10px;
                 background-color: #4263eb;
                 color: #ffffff;
             }
@@ -4218,14 +4656,14 @@ class MainWindow(QMainWindow):
 
         self.dust_button = QPushButton("Dust Composition", self)
         self.dust_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.dust_button.setMinimumHeight(46)
+        self.dust_button.setMinimumHeight(34)
         self.dust_button.setStyleSheet(
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 700;
-                padding: 10px 22px;
-                border-radius: 14px;
+                padding: 5px 12px;
+                border-radius: 10px;
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                                                  stop:0 #845ef7, stop:1 #5c7cfa);
                 color: #ffffff;
@@ -4248,14 +4686,14 @@ class MainWindow(QMainWindow):
 
         self.dust_estimator_button = QPushButton("Impact Parameters", self)
         self.dust_estimator_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.dust_estimator_button.setMinimumHeight(46)
+        self.dust_estimator_button.setMinimumHeight(34)
         self.dust_estimator_button.setStyleSheet(
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 700;
-                padding: 10px 22px;
-                border-radius: 14px;
+                padding: 5px 12px;
+                border-radius: 10px;
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                                                  stop:0 #0ca678, stop:1 #099268);
                 color: #ffffff;
@@ -4275,14 +4713,14 @@ class MainWindow(QMainWindow):
 
         self.sql_match_button = QPushButton("Accelerator Match", self)
         self.sql_match_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.sql_match_button.setMinimumHeight(46)
+        self.sql_match_button.setMinimumHeight(34)
         self.sql_match_button.setStyleSheet(
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 700;
-                padding: 10px 22px;
-                border-radius: 14px;
+                padding: 5px 12px;
+                border-radius: 10px;
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                                                  stop:0 #228be6, stop:1 #1c7ed6);
                 color: #ffffff;
@@ -4305,14 +4743,14 @@ class MainWindow(QMainWindow):
 
         self.noise_button = QPushButton("Noise Analysis", self)
         self.noise_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.noise_button.setMinimumHeight(46)
+        self.noise_button.setMinimumHeight(34)
         self.noise_button.setStyleSheet(
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 700;
-                padding: 10px 22px;
-                border-radius: 14px;
+                padding: 5px 12px;
+                border-radius: 10px;
                 background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                                                  stop:0 #4dabf7, stop:1 #3b82f6);
                 color: #ffffff;
@@ -4335,6 +4773,7 @@ class MainWindow(QMainWindow):
         act_reload.triggered.connect(self.reload_current)
         tb.addAction(act_reload)
         tb.addAction(self.view_structure_action)
+        tb.addAction(self.event_data_action)
         tb.addAction(self.open_hdf_explorer_action)
         if launch_variable_definitions_viewer is not None:
             tb.addAction(self.open_variable_definitions_action)
@@ -4354,12 +4793,12 @@ class MainWindow(QMainWindow):
 
         self.event_combo = QComboBox(self)
         self.event_combo.setMinimumWidth(220)
-        self.event_combo.setStyleSheet("font-size: 15px; min-height: 36px;")
+        self.event_combo.setStyleSheet("font-size: 15px; min-height: 30px;")
         self.event_combo.currentIndexChanged.connect(self.on_event_changed)
         tb.addWidget(self.event_combo)
 
         toolbar_container.adjustSize()
-        scroll.setMinimumHeight(tb.sizeHint().height() + 16)
+        scroll.setMinimumHeight(tb.sizeHint().height() + 8)
 
     def _setup_event_shortcuts(self) -> None:
         """Attach arrow-key shortcuts for stepping between events."""
@@ -4435,25 +4874,30 @@ class MainWindow(QMainWindow):
         heading = QLabel("Display Controls", self)
         heading.setObjectName("controlHeading")
         heading.setStyleSheet("font-size: 19px; font-weight: 600;")
-        panel_layout.addWidget(heading)
 
         sub_label = QLabel("Choose which channels and overlays are shown:", self)
         sub_label.setStyleSheet("font-size: 15px; color: #4a5568;")
-        panel_layout.addWidget(sub_label)
+
+        header_layout = QVBoxLayout()
+        header_layout.setContentsMargins(6, 0, 0, 0)
+        header_layout.setSpacing(0)
+        header_layout.addWidget(heading)
+        header_layout.addWidget(sub_label)
+        panel_layout.addLayout(header_layout)
 
         channel_widget = QWidget(self)
-        grid = QGridLayout(channel_widget)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(10)
+        channel_row = QHBoxLayout(channel_widget)
+        channel_row.setContentsMargins(6, 0, 0, 2)
+        channel_row.setSpacing(8)
         self.channel_buttons: Dict[str, QPushButton] = {}
 
         toggle_style = (
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 600;
-                padding: 10px 18px;
-                border-radius: 12px;
+                padding: 4px 10px;
+                border-radius: 10px;
                 background-color: #e8f0ff;
                 border: 1px solid #c3d0ff;
             }
@@ -4470,10 +4914,10 @@ class MainWindow(QMainWindow):
         primary_style = (
             """
             QPushButton {
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: 600;
-                padding: 10px 18px;
-                border-radius: 12px;
+                padding: 4px 10px;
+                border-radius: 10px;
                 background-color: #4263eb;
                 color: #ffffff;
             }
@@ -4484,27 +4928,30 @@ class MainWindow(QMainWindow):
         )
 
         self._primary_channel_buttons: List[QPushButton] = []
-        for idx, name in enumerate(CHANNEL_ORDER):
+        for name in CHANNEL_ORDER:
             btn = QPushButton(name, self)
             btn.setCheckable(True)
             btn.setChecked(True)
-            btn.setMinimumHeight(50)
+            btn.setMinimumHeight(0)
             btn.setStyleSheet(toggle_style)
-            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda checked, channel=name: self.on_channel_toggled(channel, checked))
             self.channel_buttons[name] = btn
-            grid.addWidget(btn, idx // 3, idx % 3)
+            channel_row.addWidget(btn)
             self._primary_channel_buttons.append(btn)
+        channel_row.addStretch(1)
 
         panel_layout.addWidget(channel_widget)
 
         toggle_row = QHBoxLayout()
-        toggle_row.setSpacing(10)
+        toggle_row.setContentsMargins(6, 0, 0, 12)
+        toggle_row.setSpacing(8)
 
         self.overlay_button = QPushButton("Overlay same time axis", self)
         self.overlay_button.setCheckable(True)
-        self.overlay_button.setMinimumHeight(50)
+        self.overlay_button.setMinimumHeight(0)
         self.overlay_button.setStyleSheet(toggle_style)
+        self.overlay_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.overlay_button.setToolTip("When enabled, channels with the same time base are drawn together.")
         self.overlay_button.clicked.connect(self.on_overlay_toggled)
         toggle_row.addWidget(self.overlay_button)
@@ -4513,8 +4960,9 @@ class MainWindow(QMainWindow):
         for channel in sorted(FIT_ELIGIBLE_CHANNELS):
             btn = QPushButton(f"Show {channel} Fit", self)
             btn.setCheckable(True)
-            btn.setMinimumHeight(50)
+            btn.setMinimumHeight(0)
             btn.setStyleSheet(toggle_style)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.setToolTip("Overlay fit curves when available.")
             btn.clicked.connect(lambda checked, chan=channel: self.on_fit_toggled(chan, checked))
             toggle_row.addWidget(btn)
@@ -4522,8 +4970,9 @@ class MainWindow(QMainWindow):
 
         self.stats_selector_button = QPushButton("Statistics Selector", self)
         self.stats_selector_button.setCheckable(True)
-        self.stats_selector_button.setMinimumHeight(50)
+        self.stats_selector_button.setMinimumHeight(0)
         self.stats_selector_button.setStyleSheet(toggle_style)
+        self.stats_selector_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.stats_selector_button.setToolTip(
             "Select a waveform region to display min/mean/max/std statistics."
         )
@@ -4531,52 +4980,21 @@ class MainWindow(QMainWindow):
         toggle_row.addWidget(self.stats_selector_button)
 
         self.edit_params_button = QPushButton("Edit Fit Parameters", self)
-        self.edit_params_button.setMinimumHeight(50)
+        self.edit_params_button.setMinimumHeight(0)
         self.edit_params_button.setStyleSheet(primary_style)
+        self.edit_params_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.edit_params_button.clicked.connect(self.open_fit_parameter_dialog)
         toggle_row.addWidget(self.edit_params_button)
 
         toggle_row.addStretch(1)
         panel_layout.addLayout(toggle_row)
 
-        self._harmonize_primary_button_widths()
-        QTimer.singleShot(0, self._harmonize_primary_button_widths)
-
         self.vbox.addWidget(panel)
 
     def _harmonize_primary_button_widths(self) -> None:
-        """Ensure channel toggles share the width of the primary action button."""
+        """Keep quicklook controls content-sized instead of forcing equal-width buttons."""
 
-        if not getattr(self, "_primary_channel_buttons", None):
-            return
-
-        reference_widgets = [
-            self.edit_params_button,
-            self.overlay_button,
-            getattr(self, "stats_selector_button", None),
-            *self.fit_buttons.values(),
-        ]
-        reference_width = 0
-        for widget in reference_widgets:
-            if widget is None:
-                continue
-            reference_width = max(reference_width, widget.sizeHint().width())
-
-        if reference_width <= 0:
-            return
-
-        reference_height = 0
-        for widget in reference_widgets:
-            if widget is None:
-                continue
-            reference_height = max(reference_height, widget.sizeHint().height())
-
-        for btn in self._primary_channel_buttons:
-            btn.setMinimumWidth(reference_width)
-            btn.setMaximumWidth(reference_width)
-            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            if reference_height > 0:
-                btn.setFixedHeight(max(btn.minimumHeight(), reference_height))
+        return
 
     def _reset_layout_engine(self) -> None:
         """Re-enable Matplotlib's constrained layout after clearing the figure."""
@@ -4777,6 +5195,117 @@ class MainWindow(QMainWindow):
                 self._child_windows.remove(viewer)
 
         viewer.destroyed.connect(_cleanup)
+
+    def _build_event_data_summary(
+        self,
+        event_name: str,
+        *,
+        global_attributes: Dict[str, Any],
+        event_attributes: List[Tuple[str, str, Any]],
+        event_metadata: List[Tuple[str, Any, str]],
+    ) -> str:
+        lines = [
+            f"File: {self._filename or ''}",
+            f"Source: {self._data_source.describe() if self._data_source is not None else ''}",
+            f"Event: {event_name}",
+        ]
+
+        aid = _get_event_aid(self._data_source, event_name)
+        if aid is not None:
+            lines.append(f"AID: {aid}")
+
+        packet_time = _guess_packet_time_seconds(self._data_source, event_name) if self._data_source else None
+        if packet_time is not None:
+            lines.append(f"Packet Time: {packet_time:.6f}")
+            packet_time_utc = _packet_time_utc_text(self._data_source, event_name)
+            if packet_time_utc is not None:
+                lines.append(f"Packet Time Approx. UTC: {packet_time_utc}")
+
+        timestamp_ms = _guess_event_timestamp_ms(self._data_source, event_name) if self._data_source else None
+        if timestamp_ms is not None:
+            try:
+                utc_text = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).isoformat()
+            except Exception:
+                utc_text = str(timestamp_ms)
+            lines.append(f"Event Timestamp (UTC): {utc_text}")
+
+        lines.append(f"Global Attributes: {len(global_attributes)}")
+        lines.append(f"Event Attributes: {len(event_attributes)}")
+        lines.append(f"Event Variables: {len(event_metadata)}")
+        return "\n".join(lines)
+
+    def _refresh_event_data_dialog(self) -> None:
+        if (
+            self._event_data_dialog is None
+            or self._data_source is None
+            or not self._current_event
+        ):
+            return
+
+        global_attributes = self._data_source.get_global_attributes()
+        event_attributes = self._data_source.event_attribute_rows(self._current_event)
+        event_metadata = self._data_source.event_metadata_rows(self._current_event)
+        summary_text = self._build_event_data_summary(
+            self._current_event,
+            global_attributes=global_attributes,
+            event_attributes=event_attributes,
+            event_metadata=event_metadata,
+        )
+
+        self._event_data_dialog.setWindowTitle(f"Event Data - Event {self._current_event}")
+        self._event_data_dialog.update_contents(
+            summary_text=summary_text,
+            global_attributes=global_attributes,
+            event_attributes=event_attributes,
+            event_metadata=event_metadata,
+        )
+
+    def _close_event_data_dialog(self) -> None:
+        if self._event_data_dialog is None:
+            return
+        self._event_data_dialog.close()
+        self._event_data_dialog.deleteLater()
+        self._event_data_dialog = None
+
+    def action_open_event_data(self) -> None:
+        if not self._filename or not self._data_source:
+            QMessageBox.information(
+                self,
+                "No File Loaded",
+                "Open a data file to inspect the current event.",
+            )
+            return
+
+        if not self._current_event:
+            QMessageBox.information(
+                self,
+                "No Event Selected",
+                "Select an event first.",
+            )
+            return
+
+        if self._event_data_dialog is None:
+            self._event_data_dialog = EventDataDialog(
+                self,
+                summary_text="",
+                global_attributes={},
+                event_attributes=[],
+                event_metadata=[],
+            )
+            self._event_data_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+            def _clear_reference(_object=None) -> None:
+                self._event_data_dialog = None
+
+            self._event_data_dialog.destroyed.connect(_clear_reference)
+
+        self._refresh_event_data_dialog()
+        if self._event_data_dialog is None:
+            return
+
+        self._event_data_dialog.show()
+        self._event_data_dialog.raise_()
+        self._event_data_dialog.activateWindow()
 
     def action_open_hdf_explorer(self) -> None:
         if not self._filename:
@@ -5606,13 +6135,14 @@ class MainWindow(QMainWindow):
         self.figure.clear()
         self._reset_layout_engine()
         try:
-            self.figure.set_constrained_layout_pads(wspace=0.06, hspace=0.28)
+            self.figure.set_constrained_layout_pads(wspace=0.06, hspace=0.00)
         except Exception:
             pass
 
         if not self._data_source or not event_name:
             self._broadcast_event_to_children(None)
             self._current_event = None
+            self._close_event_data_dialog()
             ax = self.figure.add_subplot(111)
             ax.text(
                 0.5,
@@ -5634,6 +6164,7 @@ class MainWindow(QMainWindow):
 
         self._current_event = event_name
         self._broadcast_event_to_children(event_name)
+        self._refresh_event_data_dialog()
         self._update_channel_button_states(event_name)
         self.refresh_fit_controls()
 
@@ -5716,7 +6247,7 @@ class MainWindow(QMainWindow):
                     )
                     ax.axis("off")
                 else:
-                    grid = self.figure.add_gridspec(len(ordered), 1, hspace=0.3)
+                    grid = self.figure.add_gridspec(len(ordered), 1, hspace=0.00)
                     for idx, channel in enumerate(ordered):
                         ax = self.figure.add_subplot(grid[idx, 0])
                         axes.append(ax)
@@ -6466,6 +6997,7 @@ class MainWindow(QMainWindow):
 
     # --- Cleanup ---------------------------------------------------------
     def closeEvent(self, event):
+        self._close_event_data_dialog()
         if self._data_source is not None:
             try:
                 self._data_source.close()
