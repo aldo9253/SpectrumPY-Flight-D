@@ -3915,6 +3915,44 @@ class MainWindow(QMainWindow):
             """
             QScrollArea { border: none; background: transparent; }
             QScrollArea > QWidget > QWidget { background: transparent; }
+            QScrollBar:vertical {
+                background: #d9dee8;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #5f6368;
+                min-height: 28px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #4b4f54;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            QScrollBar:horizontal {
+                background: #d9dee8;
+                height: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #5f6368;
+                min-width: 28px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #4b4f54;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: transparent;
+            }
             """
         )
         self.scroll_area.setWidget(self._plot_container)
@@ -4163,6 +4201,44 @@ class MainWindow(QMainWindow):
             }
             QScrollArea#quicklookToolbarScrollArea > QWidget > QWidget {
                 background-color: #ffffff;
+            }
+            QScrollBar:vertical {
+                background: #d9dee8;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #5f6368;
+                min-height: 28px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #4b4f54;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            QScrollBar:horizontal {
+                background: #d9dee8;
+                height: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #5f6368;
+                min-width: 28px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #4b4f54;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: transparent;
             }
             """
         )
@@ -4434,16 +4510,21 @@ class MainWindow(QMainWindow):
         heading = QLabel("Display Controls", self)
         heading.setObjectName("controlHeading")
         heading.setStyleSheet("font-size: 19px; font-weight: 600;")
-        panel_layout.addWidget(heading)
 
         sub_label = QLabel("Choose which channels and overlays are shown:", self)
         sub_label.setStyleSheet("font-size: 15px; color: #4a5568;")
-        panel_layout.addWidget(sub_label)
+
+        header_layout = QVBoxLayout()
+        header_layout.setContentsMargins(6, 0, 0, 0)
+        header_layout.setSpacing(0)
+        header_layout.addWidget(heading)
+        header_layout.addWidget(sub_label)
+        panel_layout.addLayout(header_layout)
 
         channel_widget = QWidget(self)
-        grid = QGridLayout(channel_widget)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(10)
+        channel_row = QHBoxLayout(channel_widget)
+        channel_row.setContentsMargins(6, 0, 0, 2)
+        channel_row.setSpacing(10)
         self.channel_buttons: Dict[str, QPushButton] = {}
 
         toggle_style = (
@@ -4451,7 +4532,7 @@ class MainWindow(QMainWindow):
             QPushButton {
                 font-size: 16px;
                 font-weight: 600;
-                padding: 10px 18px;
+                padding: 7px 18px;
                 border-radius: 12px;
                 background-color: #e8f0ff;
                 border: 1px solid #c3d0ff;
@@ -4471,7 +4552,7 @@ class MainWindow(QMainWindow):
             QPushButton {
                 font-size: 16px;
                 font-weight: 600;
-                padding: 10px 18px;
+                padding: 7px 18px;
                 border-radius: 12px;
                 background-color: #4263eb;
                 color: #ffffff;
@@ -4483,26 +4564,28 @@ class MainWindow(QMainWindow):
         )
 
         self._primary_channel_buttons: List[QPushButton] = []
-        for idx, name in enumerate(CHANNEL_ORDER):
+        for name in CHANNEL_ORDER:
             btn = QPushButton(name, self)
             btn.setCheckable(True)
             btn.setChecked(True)
-            btn.setMinimumHeight(50)
+            btn.setMinimumHeight(42)
             btn.setStyleSheet(toggle_style)
-            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda checked, channel=name: self.on_channel_toggled(channel, checked))
             self.channel_buttons[name] = btn
-            grid.addWidget(btn, idx // 3, idx % 3)
+            channel_row.addWidget(btn)
             self._primary_channel_buttons.append(btn)
+        channel_row.addStretch(1)
 
         panel_layout.addWidget(channel_widget)
 
         toggle_row = QHBoxLayout()
+        toggle_row.setContentsMargins(6, 0, 0, 12)
         toggle_row.setSpacing(10)
 
         self.overlay_button = QPushButton("Overlay same time axis", self)
         self.overlay_button.setCheckable(True)
-        self.overlay_button.setMinimumHeight(50)
+        self.overlay_button.setMinimumHeight(42)
         self.overlay_button.setStyleSheet(toggle_style)
         self.overlay_button.setToolTip("When enabled, channels with the same time base are drawn together.")
         self.overlay_button.clicked.connect(self.on_overlay_toggled)
@@ -4512,7 +4595,7 @@ class MainWindow(QMainWindow):
         for channel in sorted(FIT_ELIGIBLE_CHANNELS):
             btn = QPushButton(f"Show {channel} Fit", self)
             btn.setCheckable(True)
-            btn.setMinimumHeight(50)
+            btn.setMinimumHeight(42)
             btn.setStyleSheet(toggle_style)
             btn.setToolTip("Overlay fit curves when available.")
             btn.clicked.connect(lambda checked, chan=channel: self.on_fit_toggled(chan, checked))
@@ -4521,7 +4604,7 @@ class MainWindow(QMainWindow):
 
         self.stats_selector_button = QPushButton("Statistics Selector", self)
         self.stats_selector_button.setCheckable(True)
-        self.stats_selector_button.setMinimumHeight(50)
+        self.stats_selector_button.setMinimumHeight(42)
         self.stats_selector_button.setStyleSheet(toggle_style)
         self.stats_selector_button.setToolTip(
             "Select a waveform region to display min/mean/max/std statistics."
@@ -4530,7 +4613,7 @@ class MainWindow(QMainWindow):
         toggle_row.addWidget(self.stats_selector_button)
 
         self.edit_params_button = QPushButton("Edit Fit Parameters", self)
-        self.edit_params_button.setMinimumHeight(50)
+        self.edit_params_button.setMinimumHeight(42)
         self.edit_params_button.setStyleSheet(primary_style)
         self.edit_params_button.clicked.connect(self.open_fit_parameter_dialog)
         toggle_row.addWidget(self.edit_params_button)
@@ -4544,33 +4627,32 @@ class MainWindow(QMainWindow):
         self.vbox.addWidget(panel)
 
     def _harmonize_primary_button_widths(self) -> None:
-        """Ensure channel toggles share the width of the primary action button."""
+        """Use a shared fixed size so both control rows align column-by-column."""
 
         if not getattr(self, "_primary_channel_buttons", None):
             return
 
-        reference_widgets = [
+        secondary_buttons = [
             self.edit_params_button,
             self.overlay_button,
             getattr(self, "stats_selector_button", None),
             *self.fit_buttons.values(),
         ]
-        reference_width = 0
-        for widget in reference_widgets:
-            if widget is None:
-                continue
-            reference_width = max(reference_width, widget.sizeHint().width())
+        all_buttons = [
+            *self._primary_channel_buttons,
+            *(btn for btn in secondary_buttons if btn is not None),
+        ]
+        if not all_buttons:
+            return
+
+        reference_width = max(btn.sizeHint().width() for btn in all_buttons)
 
         if reference_width <= 0:
             return
 
-        reference_height = 0
-        for widget in reference_widgets:
-            if widget is None:
-                continue
-            reference_height = max(reference_height, widget.sizeHint().height())
+        reference_height = max(btn.sizeHint().height() for btn in all_buttons)
 
-        for btn in self._primary_channel_buttons:
+        for btn in all_buttons:
             btn.setMinimumWidth(reference_width)
             btn.setMaximumWidth(reference_width)
             btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -5512,7 +5594,7 @@ class MainWindow(QMainWindow):
         self.figure.clear()
         self._reset_layout_engine()
         try:
-            self.figure.set_constrained_layout_pads(wspace=0.06, hspace=0.28)
+            self.figure.set_constrained_layout_pads(wspace=0.06, hspace=0.00)
         except Exception:
             pass
 
@@ -5622,7 +5704,7 @@ class MainWindow(QMainWindow):
                     )
                     ax.axis("off")
                 else:
-                    grid = self.figure.add_gridspec(len(ordered), 1, hspace=0.3)
+                    grid = self.figure.add_gridspec(len(ordered), 1, hspace=0.00)
                     for idx, channel in enumerate(ordered):
                         ax = self.figure.add_subplot(grid[idx, 0])
                         axes.append(ax)
