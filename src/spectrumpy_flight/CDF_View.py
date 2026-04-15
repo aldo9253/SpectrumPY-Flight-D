@@ -144,9 +144,6 @@ class CDFViewWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal, central)
         splitter.setChildrenCollapsible(False)
-        if hasattr(splitter, "setCollapsible"):
-            splitter.setCollapsible(0, False)
-            splitter.setCollapsible(1, False)
         layout.addWidget(splitter)
 
         self._tree = QTreeWidget(splitter)
@@ -178,6 +175,10 @@ class CDFViewWindow(QMainWindow):
         self._attr_table.setHorizontalHeaderLabels(["Attribute", "Value"])
         self._attr_table.horizontalHeader().setStretchLastSection(True)
         tabs.addTab(self._attr_table, "Attributes")
+
+        if hasattr(splitter, "setCollapsible"):
+            splitter.setCollapsible(0, False)
+            splitter.setCollapsible(1, False)
 
         self.setCentralWidget(central)
 

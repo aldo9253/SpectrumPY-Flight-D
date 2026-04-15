@@ -4238,6 +4238,7 @@ class MainWindow(QMainWindow):
         # building the control panel) were leaving the attribute undefined which
         # caused an ``AttributeError`` when plotting the first event.
         self.fit_buttons: Dict[str, QPushButton] = {}
+        self._action_grid_buttons: Dict[str, QPushButton] = {}
         self.selected_channels = set(CHANNEL_ORDER)
         self._child_windows: List[QWidget] = []
         self._dust_bridge_files: Dict[int, Tuple[Any, str]] = {}
@@ -4259,7 +4260,6 @@ class MainWindow(QMainWindow):
             self.vbox.addWidget(branding_widget)
 
         self._build_menubar()
-        self._build_toolbar()
         self._build_controls()
         self._setup_event_shortcuts()
 
@@ -4882,11 +4882,11 @@ class MainWindow(QMainWindow):
         panel_layout.setSpacing(8)
         panel_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        heading = QLabel("Display Controls", self)
+        heading = QLabel("Quicklook Controls", self)
         heading.setObjectName("controlHeading")
         heading.setStyleSheet("font-size: 19px; font-weight: 600;")
 
-        sub_label = QLabel("Choose which channels and overlays are shown:", self)
+        sub_label = QLabel("Open data, navigate events, and choose which channels and overlays are shown:", self)
         sub_label.setStyleSheet("font-size: 15px; color: #4a5568;")
 
         header_layout = QVBoxLayout()
@@ -4896,49 +4896,159 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(sub_label)
         panel_layout.addLayout(header_layout)
 
-        channel_widget = QWidget(self)
-        channel_row = QHBoxLayout(channel_widget)
-        channel_row.setContentsMargins(6, 0, 0, 2)
-        channel_row.setSpacing(8)
+        button_grid_widget = QWidget(self)
+        button_grid_widget.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        button_grid = QGridLayout(button_grid_widget)
+        button_grid.setContentsMargins(6, 0, 0, 10)
+        button_grid.setHorizontalSpacing(4)
+        button_grid.setVerticalSpacing(4)
+        button_grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.channel_buttons: Dict[str, QPushButton] = {}
 
         toggle_style = (
             """
             QPushButton {
-                font-size: 15px;
+                font-size: 14px;
                 font-weight: 600;
                 padding: 4px 10px;
                 border-radius: 10px;
-                background-color: #e8f0ff;
-                border: 1px solid #c3d0ff;
+                background-color: #f3f6fd;
+                border: 1px solid #d3ddef;
+                color: #1f2937;
             }
             QPushButton:hover {
-                background-color: #dbe4ff;
+                background-color: #e8eefc;
             }
             QPushButton:checked {
                 background-color: #4c6ef5;
-                color: #ffffff;
                 border: 1px solid #364fc7;
+                color: #ffffff;
+            }
+            QPushButton:disabled {
+                background-color: #e5e7eb;
+                border: 1px solid #d1d5db;
+                color: #9ca3af;
+            }
+            """
+        )
+        action_style = (
+            """
+            QPushButton {
+                font-size: 14px;
+                font-weight: 600;
+                padding: 4px 10px;
+                border-radius: 10px;
+                background-color: #f3f6fd;
+                border: 1px solid #d3ddef;
+                color: #1f2937;
+            }
+            QPushButton:hover {
+                background-color: #e8eefc;
+            }
+            QPushButton:checked {
+                background-color: #4c6ef5;
+                border: 1px solid #364fc7;
+                color: #ffffff;
+            }
+            QPushButton:disabled {
+                background-color: #e5e7eb;
+                border: 1px solid #d1d5db;
+                color: #9ca3af;
             }
             """
         )
         primary_style = (
             """
             QPushButton {
-                font-size: 15px;
+                font-size: 14px;
                 font-weight: 600;
                 padding: 4px 10px;
                 border-radius: 10px;
-                background-color: #4263eb;
-                color: #ffffff;
+                background-color: #f3f6fd;
+                border: 1px solid #d3ddef;
+                color: #1f2937;
             }
             QPushButton:hover {
-                background-color: #3b5bdb;
+                background-color: #e8eefc;
+            }
+            QPushButton:checked {
+                background-color: #4c6ef5;
+                border: 1px solid #364fc7;
+                color: #ffffff;
+            }
+            QPushButton:disabled {
+                background-color: #e5e7eb;
+                border: 1px solid #d1d5db;
+                color: #9ca3af;
             }
             """
         )
 
+        action_widgets: List[QWidget] = []
+        control_buttons: List[QPushButton] = []
+
+        event_widget = QWidget(self)
+        event_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        event_layout = QHBoxLayout(event_widget)
+        event_layout.setContentsMargins(0, 0, 0, 0)
+        event_layout.setSpacing(4)
+        event_label = QLabel("Event:", event_widget)
+        event_label.setStyleSheet("font-size: 15px; font-weight: 600; color: #1f2937;")
+        event_layout.addWidget(event_label)
+        self._event_grid_label = event_label
+        self.event_combo = QComboBox(event_widget)
+        self.event_combo.setMinimumWidth(220)
+        self.event_combo.setFixedHeight(28)
+        self.event_combo.setStyleSheet("font-size: 15px; min-height: 28px;")
+        self.event_combo.currentIndexChanged.connect(self.on_event_changed)
+        event_layout.addWidget(self.event_combo)
+        self._event_grid_widget = event_widget
+        action_widgets.append(event_widget)
+
+        action_specs: List[Tuple[str, Callable[[], None], str]] = [
+            # File/menu duplicates kept here for easy restoration if we want them back.
+            # ("Open…", lambda: self.open_any_action.trigger(), "Open an HDF5 or CDF file"),
+            # ("Open HDF5", lambda: self.open_hdf5_action.trigger(), "Open an HDF5 data file"),
+            # ("Open CDF", lambda: self.open_cdf_action.trigger(), "Open a CDF data file"),
+            # ("Reload", self.reload_current, "Reload the current file"),
+            # ("Close File", lambda: self.close_file_action.trigger(), "Close the current data file"),
+            # ("Save PNG", lambda: self.save_plot("png"), "Save the current plot as a PNG image"),
+            # ("Save PDF", lambda: self.save_plot("pdf"), "Save the current plot as a PDF"),
+            # ("Save SVG", lambda: self.save_plot("svg"), "Save the current plot as an SVG"),
+            ("Export CSV", self.save_event_csv, "Export the current event data as CSV"),
+            ("Data Browser", self.action_view_structure, "Open the data browser"),
+            ("Event Data", self.action_open_event_data, "View datasets and attributes for the current event"),
+            ("HDF Explorer", self.action_open_hdf_explorer, "Launch the standalone HDF Explorer"),
+            (
+                "Variable Defs",
+                self.action_open_variable_definitions,
+                "Open the variable definitions viewer",
+            ),
+            ("Composition", self.action_open_dust_composition, "Open dust composition analysis"),
+            ("Impact Params", self.action_open_dust_estimator, "Open the impact parameter estimator"),
+            ("Accel. Match", self.action_open_sql_matcher, "Match the current event to accelerator records"),
+            # ("Documentation", self.open_documentation_center, "Open the documentation center"),
+        ]
+        for text, callback, tooltip in action_specs:
+            button = QPushButton(text, self)
+            button.setMinimumHeight(32)
+            button.setStyleSheet(action_style)
+            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            button.setToolTip(tooltip)
+            button.clicked.connect(callback)
+            if text == "Variable Defs":
+                button.setEnabled(launch_variable_definitions_viewer is not None)
+            if text == "Data Browser":
+                self.data_browser_button = button
+            elif text == "HDF Explorer":
+                self.hdf_explorer_button = button
+            self._action_grid_buttons[text] = button
+            action_widgets.append(button)
+            control_buttons.append(button)
+
         self._primary_channel_buttons: List[QPushButton] = []
+        channel_widgets: List[QWidget] = []
+        fit_row_widgets: List[QWidget] = []
         for name in CHANNEL_ORDER:
             btn = QPushButton(name, self)
             btn.setCheckable(True)
@@ -4948,27 +5058,23 @@ class MainWindow(QMainWindow):
             btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda checked, channel=name: self.on_channel_toggled(channel, checked))
             self.channel_buttons[name] = btn
-            channel_row.addWidget(btn)
             self._primary_channel_buttons.append(btn)
-        channel_row.addStretch(1)
+            channel_widgets.append(btn)
+            control_buttons.append(btn)
 
-        panel_layout.addWidget(channel_widget)
-
-        toggle_row = QHBoxLayout()
-        toggle_row.setContentsMargins(6, 0, 0, 12)
-        toggle_row.setSpacing(8)
-
-        self.overlay_button = QPushButton("Overlay same time axis", self)
+        self.overlay_button = QPushButton("Combine Axes", self)
         self.overlay_button.setCheckable(True)
         self.overlay_button.setMinimumHeight(0)
         self.overlay_button.setStyleSheet(toggle_style)
         self.overlay_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.overlay_button.setToolTip("When enabled, channels with the same time base are drawn together.")
         self.overlay_button.clicked.connect(self.on_overlay_toggled)
-        toggle_row.addWidget(self.overlay_button)
+        channel_widgets.append(self.overlay_button)
+        control_buttons.append(self.overlay_button)
 
         self.fit_buttons: Dict[str, QPushButton] = {}
-        for channel in sorted(FIT_ELIGIBLE_CHANNELS):
+        fit_order = [channel for channel in CHANNEL_ORDER if channel in FIT_ELIGIBLE_CHANNELS]
+        for channel in fit_order:
             btn = QPushButton(f"Show {channel} Fit", self)
             btn.setCheckable(True)
             btn.setMinimumHeight(0)
@@ -4976,10 +5082,11 @@ class MainWindow(QMainWindow):
             btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.setToolTip("Overlay fit curves when available.")
             btn.clicked.connect(lambda checked, chan=channel: self.on_fit_toggled(chan, checked))
-            toggle_row.addWidget(btn)
             self.fit_buttons[channel] = btn
+            fit_row_widgets.append(btn)
+            control_buttons.append(btn)
 
-        self.stats_selector_button = QPushButton("Statistics Selector", self)
+        self.stats_selector_button = QPushButton("Stats Selector", self)
         self.stats_selector_button.setCheckable(True)
         self.stats_selector_button.setMinimumHeight(0)
         self.stats_selector_button.setStyleSheet(toggle_style)
@@ -4988,24 +5095,125 @@ class MainWindow(QMainWindow):
             "Select a waveform region to display min/mean/max/std statistics."
         )
         self.stats_selector_button.clicked.connect(self._on_stats_selector_toggled)
-        toggle_row.addWidget(self.stats_selector_button)
+        fit_row_widgets.append(self.stats_selector_button)
+        control_buttons.append(self.stats_selector_button)
 
-        self.edit_params_button = QPushButton("Edit Fit Parameters", self)
+        self.edit_params_button = QPushButton("Edit Fits", self)
         self.edit_params_button.setMinimumHeight(0)
         self.edit_params_button.setStyleSheet(primary_style)
         self.edit_params_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.edit_params_button.clicked.connect(self.open_fit_parameter_dialog)
-        toggle_row.addWidget(self.edit_params_button)
+        fit_row_widgets.append(self.edit_params_button)
+        control_buttons.append(self.edit_params_button)
 
-        toggle_row.addStretch(1)
-        panel_layout.addLayout(toggle_row)
+        self.noise_button = QPushButton("Noise Analysis", self)
+        self.noise_button.setMinimumHeight(32)
+        self.noise_button.setStyleSheet(action_style)
+        self.noise_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.noise_button.setToolTip("Inspect noise for the current event")
+        self.noise_button.clicked.connect(self.action_open_noise_analysis)
+        fit_row_widgets.append(self.noise_button)
+        control_buttons.append(self.noise_button)
+
+        self._control_grid_buttons = control_buttons
+        self._harmonize_primary_button_widths()
+        self._populate_control_button_grid(
+            button_grid,
+            action_widgets,
+            channel_widgets,
+            fit_row_widgets,
+            columns=10,
+        )
+        panel_layout.addWidget(button_grid_widget)
+        self._update_viewer_action_states()
+        self._set_edit_fit_controls_enabled(False)
 
         self.vbox.addWidget(panel)
 
-    def _harmonize_primary_button_widths(self) -> None:
-        """Keep quicklook controls content-sized instead of forcing equal-width buttons."""
+    def _populate_control_button_grid(
+        self,
+        layout: QGridLayout,
+        action_widgets: Sequence[QWidget],
+        channel_widgets: Sequence[QWidget],
+        fit_row_widgets: Sequence[QWidget],
+        *,
+        columns: int = 10,
+    ) -> None:
+        """Lay out the quicklook controls with explicit top action rows and fixed lower rows."""
 
-        return
+        if columns <= 0:
+            columns = 1
+
+        for index, widget in enumerate(action_widgets):
+            row, column = divmod(index, columns)
+            layout.addWidget(widget, row, column, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        base_row = (len(action_widgets) + columns - 1) // columns
+        for column, widget in enumerate(channel_widgets):
+            layout.addWidget(widget, base_row, column, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        for column, widget in enumerate(fit_row_widgets):
+            layout.addWidget(widget, base_row + 1, column, alignment=Qt.AlignmentFlag.AlignLeft)
+
+    def _harmonize_primary_button_widths(self) -> None:
+        """Apply one compact fixed size across the main quicklook control buttons."""
+
+        buttons = getattr(self, "_control_grid_buttons", [])
+        if not buttons:
+            return
+
+        width = max(button.sizeHint().width() for button in buttons)
+        height = max(max(button.sizeHint().height() for button in buttons), 32)
+        for button in buttons:
+            button.setFixedSize(width, height)
+
+        event_widget = getattr(self, "_event_grid_widget", None)
+        event_label = getattr(self, "_event_grid_label", None)
+        if event_widget is not None and event_label is not None and self.event_combo is not None:
+            spacing = event_widget.layout().spacing() if event_widget.layout() is not None else 4
+            label_width = event_label.sizeHint().width()
+            combo_width = max(40, width - label_width - spacing)
+            event_widget.setFixedSize(width, height)
+            self.event_combo.setFixedSize(combo_width, max(24, height - 4))
+
+    def _set_edit_fit_controls_enabled(self, enabled: bool) -> None:
+        self.edit_fit_action.setEnabled(enabled)
+        if hasattr(self, "edit_params_button"):
+            self.edit_params_button.setEnabled(enabled)
+            if enabled:
+                self.edit_params_button.setToolTip("Open the fit-parameter editor for this event.")
+            else:
+                self.edit_params_button.setToolTip("No editable fit parameters were found for this event.")
+
+    def _has_editable_fit_parameters(self, event_name: Optional[str]) -> bool:
+        if not event_name or not self._data_source:
+            return False
+        for channel in FIT_ELIGIBLE_CHANNELS:
+            if self.get_fit_data(event_name, channel).has_parameters():
+                return True
+        return False
+
+    def _update_viewer_action_states(self) -> None:
+        has_data = bool(self._filename and self._data_source)
+        supports_browser = bool(has_data and self._data_source and self._data_source.supports_structure_viewer())
+        is_hdf = bool(self._filename and Path(self._filename).suffix.lower() in {".h5", ".hdf5"})
+
+        self.view_structure_action.setEnabled(supports_browser)
+        self.open_hdf_explorer_action.setEnabled(has_data and is_hdf)
+
+        if hasattr(self, "data_browser_button"):
+            self.data_browser_button.setEnabled(supports_browser)
+            if supports_browser:
+                self.data_browser_button.setToolTip("Open the data browser for the current file.")
+            else:
+                self.data_browser_button.setToolTip("Open a supported data file to browse its structure.")
+
+        if hasattr(self, "hdf_explorer_button"):
+            self.hdf_explorer_button.setEnabled(has_data and is_hdf)
+            if has_data and is_hdf:
+                self.hdf_explorer_button.setToolTip("Launch the standalone HDF Explorer.")
+            else:
+                self.hdf_explorer_button.setToolTip("The HDF Explorer is only available for HDF5 products.")
 
     def _reset_layout_engine(self) -> None:
         """Re-enable Matplotlib's constrained layout after clearing the figure."""
@@ -5782,6 +5990,7 @@ class MainWindow(QMainWindow):
             return
         self._reset_state()
         self.plot_event(None)
+        self._update_viewer_action_states()
         self.statusBar().showMessage("No data file loaded.")
 
     def reset_all_overrides(self):
@@ -5945,6 +6154,8 @@ class MainWindow(QMainWindow):
         self.event_combo.blockSignals(True)
         self.event_combo.clear()
         self.event_combo.blockSignals(False)
+        self._update_viewer_action_states()
+        self._set_edit_fit_controls_enabled(False)
 
     def _get_dataset(self, event: str, dataset: str) -> Optional[np.ndarray]:
         if not self._data_source:
@@ -6180,6 +6391,7 @@ class MainWindow(QMainWindow):
         self._h5 = h5_handle
         self._data_source = source
         self._filename = path
+        self._update_viewer_action_states()
 
         events = source.list_events()
         if not events:
@@ -6812,11 +7024,14 @@ class MainWindow(QMainWindow):
         if not self._data_source or not self._current_event:
             for btn in self.fit_buttons.values():
                 btn.setEnabled(False)
+            self._set_edit_fit_controls_enabled(False)
             return
 
+        has_editable = False
         for channel, btn in self.fit_buttons.items():
             data = self.get_fit_data(self._current_event, channel)
             available = any(True for _ in self._iter_fit_curves(self._current_event, channel, data))
+            has_editable = has_editable or data.has_parameters()
             btn.setEnabled(available)
             if not available:
                 btn.setChecked(False)
@@ -6824,6 +7039,7 @@ class MainWindow(QMainWindow):
                 btn.setToolTip("No fit curve found for this event.")
             else:
                 btn.setToolTip("Overlay the available fit curve on the channel plot.")
+        self._set_edit_fit_controls_enabled(has_editable)
 
     def update_status_text(self, missing: Optional[List[str]] = None):
         parts: List[str] = []
