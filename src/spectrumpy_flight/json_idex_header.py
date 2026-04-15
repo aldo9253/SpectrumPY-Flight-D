@@ -67,6 +67,7 @@ if __package__ is None or __package__ == "":
     from lookup.dust_estimator import estimate_particle, load_default_tables
     from lookup.txhdr_descriptions import TXHDR_AUTHORITY_REFERENCE, describe_field
     from spacecraft_clock import SPACECRAFT_EPOCH, combine_coarse_fine_seconds
+    from tof_merge import combine_waveform_channels as _shared_combine_waveform_channels
 else:
     from . import package_path
     from .plot_style import apply_plot_style
@@ -76,6 +77,7 @@ else:
     from .lookup.dust_estimator import estimate_particle, load_default_tables
     from .lookup.txhdr_descriptions import TXHDR_AUTHORITY_REFERENCE, describe_field
     from .spacecraft_clock import SPACECRAFT_EPOCH, combine_coarse_fine_seconds
+    from .tof_merge import combine_waveform_channels as _shared_combine_waveform_channels
 
 try:
     if __package__ is None or __package__ == "":
@@ -521,34 +523,13 @@ def _combine_waveform_channels(
     low: Optional[np.ndarray],
     gain_map: Optional[Dict[str, float]] = None,
 ) -> Optional[np.ndarray]:
-    del gain_map
-
-    if time_axis is None:
-        return None
-
-    times = np.asarray(time_axis, dtype=float)
-    if times.size == 0:
-        return None
-
-    candidates: List[Tuple[str, np.ndarray, int]] = []
-    for label, channel in (("TOF H", high), ("TOF M", medium), ("TOF L", low)):
-        if channel is None or not getattr(channel, "size", 0):
-            continue
-        arr = np.asarray(channel, dtype=float)
-        length = min(arr.size, times.size)
-        if length <= 0:
-            continue
-        candidates.append((label, arr[:length], length))
-
-    if not candidates:
-        return None
-
-    for label, array, length in candidates:
-        if label == "TOF H":
-            return array[:length].copy()
-
-    label, array, length = candidates[0]
-    return array[:length].copy()
+    return _shared_combine_waveform_channels(
+        time_axis,
+        high,
+        medium,
+        low,
+        gain_map=gain_map,
+    )
 
 
 def _estimate_baseline(time_array: np.ndarray, signal: np.ndarray) -> float:

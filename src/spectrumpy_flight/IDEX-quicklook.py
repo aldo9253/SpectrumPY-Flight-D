@@ -103,6 +103,7 @@ from spectrumpy_flight.calibration_data import AcceleratorMatch, AcceleratorMatc
 from spectrumpy_flight.mass_calibration import TOFMassCal
 from spectrumpy_flight.noise_analysis import ChannelMeta, launch_noise_analysis_window
 from spectrumpy_flight.plot_style import apply_plot_style
+from spectrumpy_flight.tof_merge import combine_waveform_channels
 try:  # pragma: no cover - optional dependency, loaded lazily
     from spectrumpy_flight.HDF_View import launch_hdf_viewer
 except Exception:  # pragma: no cover
@@ -2027,6 +2028,11 @@ class BaseDataSource(ABC):
 class HDF5DataSource(BaseDataSource):
     """Adapter that exposes an HDF5 file via the quicklook datasource API."""
 
+    SYNTHETIC_COMBINED_DATASETS: Tuple[str, ...] = (
+        "Analysis/DustComposition/CombinedSignal",
+        "Analysis/DustComposition/CombinedTime",
+    )
+
     def __init__(self, filename: str):
         if h5py is None:  # pragma: no cover - handled in runtime environment
             raise ImportError("h5py is required to open HDF5 files but is not installed.")
@@ -2049,7 +2055,7 @@ class HDF5DataSource(BaseDataSource):
         except Exception:
             return sorted(events)
 
-    def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
+    def _read_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
         path = f"/{event}/{dataset_name}"
         try:
             obj = self._file[path]
@@ -2061,6 +2067,32 @@ class HDF5DataSource(BaseDataSource):
             except Exception:
                 return None
         return None
+
+    def _combined_time(self, event: str) -> Optional[np.ndarray]:
+        values = self._read_dataset(event, "Time (high sampling)")
+        if values is not None:
+            return values
+        return self._read_dataset(event, "Analysis/DustComposition/CombinedTime")
+
+    def _combined_signal(self, event: str) -> Optional[np.ndarray]:
+        time_axis = self._combined_time(event)
+        if time_axis is not None:
+            combined = combine_waveform_channels(
+                np.asarray(time_axis, dtype=float).ravel(),
+                self._read_dataset(event, "TOF H"),
+                self._read_dataset(event, "TOF M"),
+                self._read_dataset(event, "TOF L"),
+            )
+            if combined is not None:
+                return np.asarray(combined, dtype=float)
+        return self._read_dataset(event, "Analysis/DustComposition/CombinedSignal")
+
+    def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
+        if dataset_name == "Analysis/DustComposition/CombinedSignal":
+            return self._combined_signal(event)
+        if dataset_name == "Analysis/DustComposition/CombinedTime":
+            return self._combined_time(event)
+        return self._read_dataset(event, dataset_name)
 
     def get_group_attributes(self, event: str, group_path: str) -> Dict[str, Any]:
         cleaned = group_path.strip("/")
@@ -2197,6 +2229,139 @@ class CDFDataSource(BaseDataSource):
 
     SHARED_DATASETS = {"Time (high sampling)", "Time (low sampling)"}
 
+    SYNTHETIC_COMBINED_DATASETS: Tuple[str, ...] = (
+        "Analysis/DustComposition/CombinedSignal",
+        "Analysis/DustComposition/CombinedTime",
+    )
+
+    SYNTHETIC_TRIGGER_ORIGIN_ALIASES: Tuple[str, ...] = (
+        "Metadata/TriggerOrigin",
+        "Metadata/Trigger Origin",
+        "Metadata/unpacked/TriggerOrigin",
+        "Analysis/TriggerOrigin",
+    )
+
+    SYNTHETIC_GENERIC_TRIGGER_LEVEL_ALIASES: Tuple[str, ...] = (
+        "Metadata/TriggerLevel",
+        "Metadata/Trigger Level",
+        "Metadata/unpacked/TriggerLevel",
+        "Metadata/unpacked/Trigger Level",
+        "Analysis/TriggerLevel",
+        "Analysis/Trigger Level",
+    )
+
+    SYNTHETIC_GENERIC_TRIGGER_MODE_ALIASES: Tuple[str, ...] = (
+        "Metadata/TriggerMode",
+        "Metadata/TriggerType",
+        "Metadata/Trigger Type",
+        "Metadata/unpacked/TriggerMode",
+        "Metadata/unpacked/TriggerType",
+    )
+
+    SYNTHETIC_TRIGGER_LEVEL_ALIASES: Dict[str, Tuple[str, ...]] = {
+        "TOF H": (
+            "Metadata/HGTriggerLevel",
+            "Metadata/unpacked/HGTriggerLevel",
+            "Analysis/HGTriggerLevel",
+        ),
+        "TOF M": (
+            "Metadata/MGTriggerLevel",
+            "Metadata/unpacked/MGTriggerLevel",
+            "Analysis/MGTriggerLevel",
+        ),
+        "TOF L": (
+            "Metadata/LGTriggerLevel",
+            "Metadata/unpacked/LGTriggerLevel",
+            "Analysis/LGTriggerLevel",
+        ),
+        "Ion Grid": (
+            "Metadata/LSTriggerLevel",
+            "Metadata/unpacked/LSTriggerLevel",
+            "Analysis/LSTriggerLevel",
+        ),
+        "Target L": (
+            "Metadata/LSTriggerLevel",
+            "Metadata/unpacked/LSTriggerLevel",
+            "Analysis/LSTriggerLevel",
+        ),
+        "Target H": (
+            "Metadata/LSTriggerLevel",
+            "Metadata/unpacked/LSTriggerLevel",
+            "Analysis/LSTriggerLevel",
+        ),
+    }
+
+    SYNTHETIC_TRIGGER_MODE_ALIASES: Dict[str, Tuple[str, ...]] = {
+        "TOF H": (
+            "Metadata/HGTriggerMode",
+            "Metadata/unpacked/HGTriggerMode",
+            "Analysis/HGTriggerMode",
+        ),
+        "TOF M": (
+            "Metadata/MGTriggerMode",
+            "Metadata/unpacked/MGTriggerMode",
+            "Analysis/MGTriggerMode",
+        ),
+        "TOF L": (
+            "Metadata/LGTriggerMode",
+            "Metadata/unpacked/LGTriggerMode",
+            "Analysis/LGTriggerMode",
+        ),
+        "Ion Grid": (
+            "Metadata/LSTriggerMode",
+            "Metadata/unpacked/LSTriggerMode",
+            "Analysis/LSTriggerMode",
+        ),
+        "Target L": (
+            "Metadata/LSTriggerMode",
+            "Metadata/unpacked/LSTriggerMode",
+            "Analysis/LSTriggerMode",
+        ),
+        "Target H": (
+            "Metadata/LSTriggerMode",
+            "Metadata/unpacked/LSTriggerMode",
+            "Analysis/LSTriggerMode",
+        ),
+    }
+
+    DIRECT_TRIGGER_LEVEL_VARS: Dict[str, Tuple[str, ...]] = {
+        "TOF H": ("trigger_level_hg",),
+        "TOF M": ("trigger_level_mg",),
+        "TOF L": ("trigger_level_lg",),
+    }
+
+    RAW_TRIGGER_LEVEL_VARS: Dict[str, Tuple[str, ...]] = {
+        "TOF H": ("idx__txhdrhgtrigctrl1",),
+        "TOF M": ("idx__txhdrmgtrigctrl1",),
+        "TOF L": ("idx__txhdrlgtrigctrl1",),
+    }
+
+    DIRECT_TRIGGER_MODE_VARS: Dict[str, Tuple[str, ...]] = {
+        "TOF H": ("trigger_mode_hg",),
+        "TOF M": ("trigger_mode_mg",),
+        "TOF L": ("trigger_mode_lg",),
+    }
+
+    RAW_TRIGGER_MODE_VARS: Dict[str, Tuple[str, ...]] = {
+        "TOF H": ("idx__txhdrhgtrigmode",),
+        "TOF M": ("idx__txhdrmgtrigmode",),
+        "TOF L": ("idx__txhdrlgtrigmode",),
+        "Ion Grid": ("idx__txhdrlstrigmode",),
+        "Target L": ("idx__txhdrlstrigmode",),
+        "Target H": ("idx__txhdrlstrigmode",),
+    }
+
+    DIRECT_GENERIC_TRIGGER_LEVEL_VARS: Tuple[str, ...] = ("triggerlevel",)
+    DIRECT_GENERIC_TRIGGER_MODE_VARS: Tuple[str, ...] = ("triggermode",)
+    DIRECT_TRIGGER_ORIGIN_VARS: Tuple[str, ...] = ("trigger_origin",)
+    RAW_TRIGGER_ID_VARS: Tuple[str, ...] = ("idx__txhdrtrigid",)
+
+    RAW_TRIGGER_LEVEL_SCALES: Dict[str, float] = {
+        "TOF H": 2.89e-4,
+        "TOF M": 1.13e-2,
+        "TOF L": 5.14e-4,
+    }
+
     #: Mapping from analysis dataset names (under ``/event/Analysis``) to the
     #: underlying CDF variable and extraction mode.
     #: ``mode`` indicates how the data should be returned:
@@ -2271,6 +2436,8 @@ class CDFDataSource(BaseDataSource):
         self._cdflib = cdflib
         self._cdf = cdflib.CDF(filename)
         self._cache: Dict[str, np.ndarray] = {}
+        self._variable_name_lookup = self._build_variable_name_lookup()
+        self._product_level = self._infer_product_level()
         self._event_count = self._resolve_event_count()
         self._epoch_seconds: Optional[np.ndarray] = self._resolve_epoch_seconds()
 
@@ -2282,6 +2449,39 @@ class CDFDataSource(BaseDataSource):
             self._cdf.close()
         except Exception:
             pass
+
+    def _build_variable_name_lookup(self) -> Dict[str, str]:
+        try:
+            info = self._cdf.cdf_info()
+        except Exception:
+            return {}
+
+        names: List[str] = []
+        for key in ("zVariables", "rVariables"):
+            values = info.get(key, []) if isinstance(info, dict) else getattr(info, key, [])
+            for name in values or []:
+                names.append(str(name))
+
+        lookup: Dict[str, str] = {}
+        for name in names:
+            lookup.setdefault(name.lower(), name)
+        return lookup
+
+    def _resolve_varname(self, varname: str) -> Optional[str]:
+        actual = self._variable_name_lookup.get(str(varname).lower())
+        if actual:
+            return actual
+        return None
+
+    def _infer_product_level(self) -> Optional[str]:
+        stem = Path(self.filename).stem.lower()
+        for token in ("l1a", "l1b", "l2a", "l2b"):
+            if f"_{token}_" in stem:
+                return token
+        return None
+
+    def _trigger_thresholds_compatible(self) -> bool:
+        return self._product_level != "l1a"
 
     def _resolve_event_count(self) -> int:
         try:
@@ -2305,12 +2505,15 @@ class CDFDataSource(BaseDataSource):
 
     @lru_cache(maxsize=None)
     def _cached_variable(self, varname: str) -> np.ndarray:
+        actual_name = self._resolve_varname(varname)
+        if actual_name is None:
+            return np.asarray([])
         try:
-            return np.asarray(self._cdf.varget(varname))
+            return np.asarray(self._cdf.varget(actual_name))
         except Exception:
             return np.asarray([])
 
-    def _event_scalar(self, event: str, candidates: Tuple[str, ...]) -> Optional[float]:
+    def _event_value(self, event: str, candidates: Tuple[str, ...]) -> Any:
         index = self._event_index(event)
         for name in candidates:
             data = self._cached_variable(name)
@@ -2318,16 +2521,181 @@ class CDFDataSource(BaseDataSource):
                 continue
             try:
                 if data.ndim >= 1 and data.shape[0] == self._event_count:
-                    value = np.asarray(data[index]).reshape(-1)[0]
-                elif data.ndim == 0:
-                    value = data.item()
-                else:
-                    continue
-                value_f = float(value)
+                    return data[index]
+                if data.ndim == 0:
+                    return data.item()
+            except Exception:
+                continue
+        return None
+
+    def _event_scalar(self, event: str, candidates: Tuple[str, ...]) -> Optional[float]:
+        for name in candidates:
+            value = self._event_value(event, (name,))
+            if value is None:
+                continue
+            try:
+                value_f = float(np.asarray(value).reshape(-1)[0])
             except Exception:
                 continue
             if np.isfinite(value_f):
                 return value_f
+        return None
+
+    def _event_text(self, event: str, candidates: Tuple[str, ...]) -> Optional[str]:
+        for name in candidates:
+            value = self._event_value(event, (name,))
+            if value is None:
+                continue
+            text = _coerce_optional_str(value)
+            if text:
+                return text
+            try:
+                arr = np.asarray(value)
+            except Exception:
+                continue
+            if arr.size == 0:
+                continue
+            text = _coerce_optional_str(arr.reshape(-1)[0])
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _wrap_dataset_value(value: Any) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        try:
+            return np.asarray(value)
+        except Exception:
+            return None
+
+    def _combined_signal(self, event: str) -> Optional[np.ndarray]:
+        time_axis = self._combined_time(event)
+        if time_axis is None:
+            return None
+        combined = combine_waveform_channels(
+            np.asarray(time_axis, dtype=float).ravel(),
+            self.get_dataset(event, "TOF H"),
+            self.get_dataset(event, "TOF M"),
+            self.get_dataset(event, "TOF L"),
+        )
+        if combined is None:
+            return None
+        return np.asarray(combined, dtype=float)
+
+    def _combined_time(self, event: str) -> Optional[np.ndarray]:
+        values = self.get_dataset(event, "Time (high sampling)")
+        if values is None:
+            return None
+        arr = np.asarray(values, dtype=float).ravel()
+        if arr.size == 0:
+            return None
+        return np.array(arr, copy=True)
+
+    def _channel_trigger_level(self, event: str, channel: str) -> Optional[float]:
+        if not self._trigger_thresholds_compatible():
+            return None
+
+        direct = self._event_scalar(event, self.DIRECT_TRIGGER_LEVEL_VARS.get(channel, ()))
+        if direct is not None:
+            return direct
+
+        raw_value = self._event_scalar(event, self.RAW_TRIGGER_LEVEL_VARS.get(channel, ()))
+        scale = self.RAW_TRIGGER_LEVEL_SCALES.get(channel)
+        if raw_value is None or scale is None:
+            return None
+        try:
+            trigger_counts = (int(raw_value) >> 22) & 0x3FF
+        except Exception:
+            return None
+        return float(scale * trigger_counts)
+
+    def _channel_trigger_mode(self, event: str, channel: str) -> Optional[str]:
+        text = self._event_text(event, self.DIRECT_TRIGGER_MODE_VARS.get(channel, ()))
+        if text:
+            return text
+
+        raw_value = self._event_value(event, self.RAW_TRIGGER_MODE_VARS.get(channel, ()))
+        if raw_value is None:
+            return None
+
+        text = _coerce_optional_str(raw_value)
+        if text and not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
+            return text
+
+        try:
+            mode_value = int(float(np.asarray(raw_value).reshape(-1)[0]))
+        except Exception:
+            return None
+
+        if mode_value <= 0:
+            return None
+
+        channel_prefix = {
+            "TOF H": "HG",
+            "TOF M": "MG",
+            "TOF L": "LG",
+            "Ion Grid": "LS",
+            "Target L": "LS",
+            "Target H": "LS",
+        }.get(channel, "TRIG")
+        mode_label = {1: "Threshold", 2: "SinglePulse"}.get(mode_value, "DoublePulse")
+        return f"{channel_prefix}{mode_label}"
+
+    def _trigger_origin_text(self, event: str) -> Optional[str]:
+        text = self._event_text(event, self.DIRECT_TRIGGER_ORIGIN_VARS)
+        if text:
+            return text
+
+        trigger_id = self._event_scalar(event, self.RAW_TRIGGER_ID_VARS)
+        if trigger_id is None:
+            return None
+        origins = _decode_trigger_origins(int(trigger_id))
+        if not origins:
+            return None
+        return ", ".join(origins)
+
+    def _generic_trigger_level(self, event: str) -> Optional[float]:
+        if not self._trigger_thresholds_compatible():
+            return None
+
+        direct = self._event_scalar(event, self.DIRECT_GENERIC_TRIGGER_LEVEL_VARS)
+        if direct is not None:
+            return direct
+
+        origin_text = self._trigger_origin_text(event)
+        if origin_text:
+            for channel in _trigger_channels_from_origins(
+                [item.strip() for item in origin_text.split(",") if item.strip()]
+            ):
+                value = self._channel_trigger_level(event, channel)
+                if value is not None:
+                    return value
+
+        for channel in ("TOF H", "TOF M", "TOF L", "Ion Grid", "Target H", "Target L"):
+            value = self._channel_trigger_level(event, channel)
+            if value is not None:
+                return value
+        return None
+
+    def _generic_trigger_mode(self, event: str) -> Optional[str]:
+        text = self._event_text(event, self.DIRECT_GENERIC_TRIGGER_MODE_VARS)
+        if text:
+            return text
+
+        origin_text = self._trigger_origin_text(event)
+        if origin_text:
+            for channel in _trigger_channels_from_origins(
+                [item.strip() for item in origin_text.split(",") if item.strip()]
+            ):
+                text = self._channel_trigger_mode(event, channel)
+                if text:
+                    return text
+
+        for channel in ("TOF H", "TOF M", "TOF L", "Ion Grid", "Target H", "Target L"):
+            text = self._channel_trigger_mode(event, channel)
+            if text:
+                return text
         return None
 
     def _resolve_epoch_seconds(self) -> Optional[np.ndarray]:
@@ -2407,6 +2775,23 @@ class CDFDataSource(BaseDataSource):
         return [str(idx + 1) for idx in range(self._event_count)]
 
     def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
+        if dataset_name == "Analysis/DustComposition/CombinedSignal":
+            return self._combined_signal(event)
+        if dataset_name == "Analysis/DustComposition/CombinedTime":
+            return self._combined_time(event)
+        if dataset_name in self.SYNTHETIC_TRIGGER_ORIGIN_ALIASES:
+            return self._wrap_dataset_value(self._trigger_origin_text(event))
+        if dataset_name in self.SYNTHETIC_GENERIC_TRIGGER_LEVEL_ALIASES:
+            return self._wrap_dataset_value(self._generic_trigger_level(event))
+        if dataset_name in self.SYNTHETIC_GENERIC_TRIGGER_MODE_ALIASES:
+            return self._wrap_dataset_value(self._generic_trigger_mode(event))
+        for channel, aliases in self.SYNTHETIC_TRIGGER_LEVEL_ALIASES.items():
+            if dataset_name in aliases:
+                return self._wrap_dataset_value(self._channel_trigger_level(event, channel))
+        for channel, aliases in self.SYNTHETIC_TRIGGER_MODE_ALIASES.items():
+            if dataset_name in aliases:
+                return self._wrap_dataset_value(self._channel_trigger_mode(event, channel))
+
         varname = self.DATASET_MAP.get(dataset_name)
         if not varname:
             if dataset_name.startswith("Analysis/"):
@@ -2761,6 +3146,39 @@ _TRIGGER_LEVEL_DATASETS_BY_CHANNEL: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
+_TRIGGER_MODE_DATASETS_BY_CHANNEL: Dict[str, Tuple[str, ...]] = {
+    "TOF H": (
+        "Metadata/HGTriggerMode",
+        "Metadata/unpacked/HGTriggerMode",
+        "Analysis/HGTriggerMode",
+    ),
+    "TOF M": (
+        "Metadata/MGTriggerMode",
+        "Metadata/unpacked/MGTriggerMode",
+        "Analysis/MGTriggerMode",
+    ),
+    "TOF L": (
+        "Metadata/LGTriggerMode",
+        "Metadata/unpacked/LGTriggerMode",
+        "Analysis/LGTriggerMode",
+    ),
+    "Ion Grid": (
+        "Metadata/LSTriggerMode",
+        "Metadata/unpacked/LSTriggerMode",
+        "Analysis/LSTriggerMode",
+    ),
+    "Target L": (
+        "Metadata/LSTriggerMode",
+        "Metadata/unpacked/LSTriggerMode",
+        "Analysis/LSTriggerMode",
+    ),
+    "Target H": (
+        "Metadata/LSTriggerMode",
+        "Metadata/unpacked/LSTriggerMode",
+        "Analysis/LSTriggerMode",
+    ),
+}
+
 _TRIGGER_MODE_DATASETS: Tuple[str, ...] = (
     "Metadata/TriggerMode",
     "Metadata/TriggerType",
@@ -2885,6 +3303,26 @@ def _get_dataset_text(data_source: BaseDataSource, event: str, dataset: str) -> 
     return _coerce_optional_str(arr.reshape(-1)[0])
 
 
+def _decode_trigger_origins(trigger_id: int) -> List[str]:
+    """Decode IDX__TXHDRTRIGID bitfields into human-readable trigger labels."""
+
+    labels: List[str] = []
+    u10 = int(trigger_id) & 0x3FF
+    if (u10 >> 0) & 1:
+        labels.append("HS ADC0I trigger (TOF HG)")
+    if (u10 >> 1) & 1:
+        labels.append("HS ADC0Q trigger (TOF LG)")
+    if (u10 >> 2) & 1:
+        labels.append("HS ADC1Q trigger (TOF MG)")
+    if (u10 >> 3) & 1:
+        labels.append("LS ADC1 trigger (Target HG / low range)")
+    if (u10 >> 4) & 1:
+        labels.append("SW trigger")
+    if (u10 >> 5) & 1:
+        labels.append("external trigger")
+    return labels
+
+
 def _guess_trigger_level(data_source: BaseDataSource, event: str) -> Optional[float]:
     for dataset in _TRIGGER_LEVEL_DATASETS:
         value = _get_dataset_scalar(data_source, event, dataset)
@@ -2905,6 +3343,20 @@ def _guess_trigger_level_for_channel(
             if value is not None:
                 return float(value)
     return _guess_trigger_level(data_source, event)
+
+
+def _guess_trigger_mode_for_channel(
+    data_source: BaseDataSource,
+    event: str,
+    channel: str,
+) -> Optional[str]:
+    datasets = _TRIGGER_MODE_DATASETS_BY_CHANNEL.get(channel)
+    if datasets:
+        for dataset in datasets:
+            text = _get_dataset_text(data_source, event, dataset)
+            if text:
+                return text
+    return None
 
 
 def _guess_trigger_origins(data_source: BaseDataSource, event: str) -> List[str]:
@@ -2939,6 +3391,43 @@ def _trigger_channels_from_origins(origins: List[str]) -> List[str]:
     for origin in origins:
         channels.extend(origin_map.get(origin, []))
     return channels
+
+
+def _trigger_mode_is_active(trigger_mode: Optional[str]) -> bool:
+    if not trigger_mode:
+        return False
+    token = re.sub(r"[^a-z0-9]", "", str(trigger_mode).strip().lower())
+    if not token:
+        return False
+    if token in {"0", "dis", "disabled", "off", "none", "nan"}:
+        return False
+    return True
+
+
+def _guess_active_trigger_channels(data_source: BaseDataSource, event: str) -> List[str]:
+    channels: List[str] = []
+
+    for channel in _trigger_channels_from_origins(_guess_trigger_origins(data_source, event)):
+        channels.append(channel)
+
+    trigger_channel = _trigger_channel_from_mode(_guess_trigger_mode(data_source, event))
+    if trigger_channel:
+        channels.append(trigger_channel)
+
+    for channel in _TRIGGER_LEVEL_DATASETS_BY_CHANNEL:
+        if _guess_trigger_level_for_channel(data_source, event, channel) is None:
+            continue
+        if _trigger_mode_is_active(_guess_trigger_mode_for_channel(data_source, event, channel)):
+            channels.append(channel)
+
+    deduped: List[str] = []
+    seen = set()
+    for channel in channels:
+        if channel in seen:
+            continue
+        seen.add(channel)
+        deduped.append(channel)
+    return deduped
 
 
 def _guess_trigger_mode(data_source: BaseDataSource, event: str) -> Optional[str]:
@@ -6885,24 +7374,8 @@ class MainWindow(QMainWindow):
                 else:
                     times = np.asarray(t[:n], dtype=float)
                     values = np.asarray(self._apply_plot_scale(channel, y[:n]), dtype=float)
-                    x_values = times
-                    context: Optional[MassAxisContext] = None
-                    if channel == "TOF Combined" and not overlay_mode and not self._same_time_scale_enabled():
-                        context = self._compute_combined_mass_axis(event_name, times)
-                        if context is not None and context.mass.size and values.size:
-                            m = min(context.mass.size, values.size)
-                            if m > 0:
-                                context = context.trimmed(m)
-                                values = values[:m]
-                                x_values = context.mass
-                            else:
-                                context = None
-                        else:
-                            context = None
-                    if context is None:
-                        x_values = times
                     ax.plot(
-                        x_values,
+                        times,
                         values,
                         color="#111111",
                         linewidth=1.1,
@@ -6910,10 +7383,6 @@ class MainWindow(QMainWindow):
                         label=channel,
                         zorder=2,
                     )[0].set_gid("waveform")
-                    if context is not None:
-                        ax._custom_xlabel = MASS_AXIS_LABEL
-                        ax._mass_axis_context = context
-                        self._attach_time_axis(ax, context)
                     base_plotted = True
 
         fit_plotted = self._plot_fit(ax, event_name, channel, overlay_mode)
@@ -6933,12 +7402,7 @@ class MainWindow(QMainWindow):
     def _plot_trigger_level(self, ax, event_name: str, channel: str) -> None:
         if not self._data_source:
             return
-        trigger_origins = _guess_trigger_origins(self._data_source, event_name)
-        trigger_channels = _trigger_channels_from_origins(trigger_origins)
-        if not trigger_channels:
-            trigger_mode = _guess_trigger_mode(self._data_source, event_name)
-            trigger_channel = _trigger_channel_from_mode(trigger_mode)
-            trigger_channels = [trigger_channel] if trigger_channel else []
+        trigger_channels = _guess_active_trigger_channels(self._data_source, event_name)
         if channel not in trigger_channels:
             return
         trigger_level = _guess_trigger_level_for_channel(self._data_source, event_name, channel)
@@ -7092,16 +7556,8 @@ class MainWindow(QMainWindow):
             times = np.asarray(time_values[:n], dtype=float)
             values = np.asarray(fit_values[:n], dtype=float)
 
-            x_values = times
-            if channel == "TOF Combined" and not overlay_mode:
-                context = getattr(ax, "_mass_axis_context", None)
-                if isinstance(context, MassAxisContext):
-                    converted = context.time_to_mass(times)
-                    if converted.size:
-                        x_values = np.asarray(converted, dtype=float)
-
             ax.plot(
-                x_values,
+                times,
                 values,
                 color="#c1121f",
                 linewidth=2.4,
