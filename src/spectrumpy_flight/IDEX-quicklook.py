@@ -145,7 +145,7 @@ class ScrollFriendlyFigureCanvas(FigureCanvas):
 # --------- Qt binding-agnostic imports (prefer PySide6, fallback PyQt6) ---------
 _QT = None
 try:
-    from PySide6.QtCore import Qt, QSize, QTimer, QUrl, QBuffer, QIODevice, QSignalBlocker
+    from PySide6.QtCore import Qt, QSize, QTimer, QUrl, QBuffer, QIODevice, QSignalBlocker, QEvent
     from PySide6.QtGui import (
         QAction,
         QFont,
@@ -167,7 +167,7 @@ try:
     )
     _QT = "PySide6"
 except Exception:
-    from PyQt6.QtCore import Qt, QSize, QTimer, QUrl, QBuffer, QIODevice, QSignalBlocker
+    from PyQt6.QtCore import Qt, QSize, QTimer, QUrl, QBuffer, QIODevice, QSignalBlocker, QEvent
     from PyQt6.QtGui import (
         QAction,
         QFont,
@@ -4232,6 +4232,10 @@ class MainWindow(QMainWindow):
         self._stats_selectors: List[SpanSelector] = []
         self._stats_axes: List[Any] = []
         self._show_fit: Dict[str, bool] = {name: False for name in FIT_ELIGIBLE_CHANNELS}
+        self._compact_plot_mode = True
+        self._same_time_scale_mode = False
+        self._current_axis_count = 1
+        self._plot_window_handle = None
         # ``refresh_fit_controls`` is invoked as soon as data are loaded, so make
         # sure ``fit_buttons`` always exists even before the control panel is
         # constructed.  Some startup paths (for example early failures while
@@ -4325,6 +4329,8 @@ class MainWindow(QMainWindow):
             """
         )
         self.scroll_area.setWidget(self._plot_container)
+        self.scroll_area.viewport().installEventFilter(self)
+        QTimer.singleShot(0, self._bind_plot_resize_signals)
 
         self.nav_toolbar = NavigationToolbar(self.canvas, self)
         self.nav_toolbar.setStyleSheet("font-size: 14px; padding: 6px;")
@@ -5106,6 +5112,19 @@ class MainWindow(QMainWindow):
         fit_row_widgets.append(self.edit_params_button)
         control_buttons.append(self.edit_params_button)
 
+        self.same_time_scale_button = QPushButton("Same Time Scale", self)
+        self.same_time_scale_button.setCheckable(True)
+        self.same_time_scale_button.setChecked(self._same_time_scale_mode)
+        self.same_time_scale_button.setMinimumHeight(0)
+        self.same_time_scale_button.setStyleSheet(toggle_style)
+        self.same_time_scale_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.same_time_scale_button.setToolTip(
+            "When enabled, all visible plots use the same time range."
+        )
+        self.same_time_scale_button.toggled.connect(self._on_same_time_scale_toggled)
+        channel_widgets.append(self.same_time_scale_button)
+        control_buttons.append(self.same_time_scale_button)
+
         self.noise_button = QPushButton("Noise Analysis", self)
         self.noise_button.setMinimumHeight(32)
         self.noise_button.setStyleSheet(action_style)
@@ -5114,6 +5133,17 @@ class MainWindow(QMainWindow):
         self.noise_button.clicked.connect(self.action_open_noise_analysis)
         fit_row_widgets.append(self.noise_button)
         control_buttons.append(self.noise_button)
+
+        self.compact_plots_button = QPushButton("Compact Plots", self)
+        self.compact_plots_button.setCheckable(True)
+        self.compact_plots_button.setChecked(self._compact_plot_mode)
+        self.compact_plots_button.setMinimumHeight(0)
+        self.compact_plots_button.setStyleSheet(toggle_style)
+        self.compact_plots_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.compact_plots_button.setToolTip("Toggle compact plot sizing and smaller plot labels.")
+        self.compact_plots_button.toggled.connect(self._on_compact_plots_toggled)
+        channel_widgets.append(self.compact_plots_button)
+        control_buttons.append(self.compact_plots_button)
 
         self._control_grid_buttons = control_buttons
         self._harmonize_primary_button_widths()
@@ -5227,12 +5257,21 @@ class MainWindow(QMainWindow):
                 pass
 
     def _update_canvas_geometry(self, axis_count: int) -> None:
-        """Resize the canvas to keep stacked plots readable within a scroll area."""
+        """Resize the canvas for either compact or standard stacked plotting."""
 
         axis_count = max(1, axis_count)
-        base_height = 6.5
-        per_axis = 2.6
-        target_height = max(base_height, per_axis * axis_count)
+        self._current_axis_count = axis_count
+        dpi = max(float(self.figure.get_dpi()), 1.0)
+        if self._compact_plots_enabled():
+            viewport = getattr(self, "scroll_area", None)
+            viewport_height = 0
+            if viewport is not None and viewport.viewport() is not None:
+                viewport_height = max(int(viewport.viewport().height()), 0)
+            target_pixels = viewport_height if viewport_height > 0 else int(dpi * min(max(5.5, 1.05 * axis_count), 7.8))
+            target_height = max(target_pixels / dpi, 1.0)
+        else:
+            target_height = max(6.5, 2.6 * axis_count)
+            target_pixels = int(target_height * dpi)
 
         try:
             self.figure.set_size_inches(self.figure.get_figwidth(), target_height, forward=True)
@@ -5242,11 +5281,35 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        target_pixels = int(target_height * self.figure.get_dpi())
         if target_pixels > 0:
-            self.canvas.setMinimumHeight(target_pixels)
-            self.canvas.resize(self.canvas.width(), target_pixels)
+            self.canvas.setFixedHeight(target_pixels)
             self.canvas.updateGeometry()
+
+    def _refresh_plot_canvas_geometry(self) -> None:
+        if not hasattr(self, "canvas") or not hasattr(self, "figure"):
+            return
+        self._update_canvas_geometry(getattr(self, "_current_axis_count", 1))
+        self.canvas.draw_idle()
+
+    def _bind_plot_resize_signals(self) -> None:
+        window_handle = self.windowHandle()
+        previous_handle = getattr(self, "_plot_window_handle", None)
+        if previous_handle is not None and previous_handle is not window_handle:
+            try:
+                previous_handle.screenChanged.disconnect(self._on_window_screen_changed)
+            except Exception:
+                pass
+        if window_handle is None or window_handle is previous_handle:
+            return
+        try:
+            window_handle.screenChanged.connect(self._on_window_screen_changed)
+        except Exception:
+            return
+        self._plot_window_handle = window_handle
+
+    def _on_window_screen_changed(self, *_args) -> None:
+        if self._compact_plots_enabled():
+            QTimer.singleShot(0, self._refresh_plot_canvas_geometry)
 
     def _on_stats_selector_toggled(self, checked: bool) -> None:
         self._stats_selector_active = checked
@@ -5256,6 +5319,68 @@ class MainWindow(QMainWindow):
                 "Drag across a waveform to compute region statistics.",
                 6000,
             )
+
+    def _compact_plots_enabled(self) -> bool:
+        button = getattr(self, "compact_plots_button", None)
+        if button is not None:
+            return bool(button.isChecked())
+        return bool(self._compact_plot_mode)
+
+    def _same_time_scale_enabled(self) -> bool:
+        button = getattr(self, "same_time_scale_button", None)
+        if button is not None:
+            return bool(button.isChecked())
+        return bool(self._same_time_scale_mode)
+
+    def _plot_font_sizes(self) -> Dict[str, int]:
+        if self._compact_plots_enabled():
+            return {
+                "title": 16,
+                "label": 11,
+                "tick": 10,
+                "twin_label": 10,
+                "twin_tick": 9,
+                "message": 13,
+            }
+        return {
+            "title": 20,
+            "label": 16,
+            "tick": 14,
+            "twin_label": 14,
+            "twin_tick": 12,
+            "message": 16,
+        }
+
+    def _on_compact_plots_toggled(self, checked: bool) -> None:
+        self._compact_plot_mode = bool(checked)
+        self.plot_event(self._current_event)
+
+    def _on_same_time_scale_toggled(self, checked: bool) -> None:
+        self._same_time_scale_mode = bool(checked)
+        self.plot_event(self._current_event)
+
+    def showEvent(self, event):  # type: ignore[override]
+        super().showEvent(event)
+        self._bind_plot_resize_signals()
+        if self._compact_plots_enabled():
+            QTimer.singleShot(0, self._refresh_plot_canvas_geometry)
+
+    def eventFilter(self, source, event):  # type: ignore[override]
+        viewport = getattr(self, "scroll_area", None)
+        if (
+            viewport is not None
+            and source is viewport.viewport()
+            and event is not None
+            and event.type() == QEvent.Type.Resize
+            and self._compact_plots_enabled()
+        ):
+            QTimer.singleShot(0, self._refresh_plot_canvas_geometry)
+        return super().eventFilter(source, event)
+
+    def resizeEvent(self, event):  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._compact_plots_enabled():
+            QTimer.singleShot(0, self._refresh_plot_canvas_geometry)
 
     def _set_stats_selector_active(self, active: bool) -> None:
         for selector in self._stats_selectors:
@@ -6468,6 +6593,7 @@ class MainWindow(QMainWindow):
             self._current_event = None
             self._close_event_data_dialog()
             ax = self.figure.add_subplot(111)
+            self._current_axis_count = 1
             ax.text(
                 0.5,
                 0.5,
@@ -6475,7 +6601,7 @@ class MainWindow(QMainWindow):
                 ha="center",
                 va="center",
                 transform=ax.transAxes,
-                fontsize=18,
+                fontsize=self._plot_font_sizes()["message"],
             )
             ax.axis("off")
             self._update_canvas_geometry(1)
@@ -6498,12 +6624,13 @@ class MainWindow(QMainWindow):
         aid = _get_event_aid(self._data_source, event_name)
         self.figure.suptitle(
             _format_event_title(self._filename or "", event_name, aid),
-            fontsize=20,
+            fontsize=self._plot_font_sizes()["title"],
             fontweight="bold",
         )
 
         if not selected:
             ax = self.figure.add_subplot(111)
+            self._current_axis_count = 1
             ax.text(
                 0.5,
                 0.5,
@@ -6511,7 +6638,7 @@ class MainWindow(QMainWindow):
                 ha="center",
                 va="center",
                 transform=ax.transAxes,
-                fontsize=18,
+                fontsize=self._plot_font_sizes()["message"],
             )
             ax.axis("off")
             self._update_canvas_geometry(1)
@@ -6522,6 +6649,7 @@ class MainWindow(QMainWindow):
             return
 
         overlay_mode = self.overlay_button.isChecked()
+        same_time_scale = self._same_time_scale_enabled()
 
         axes: List[Any] = []
         axis_count = 1
@@ -6538,6 +6666,7 @@ class MainWindow(QMainWindow):
 
                 if not families:
                     ax = self.figure.add_subplot(111)
+                    self._current_axis_count = 1
                     ax.text(
                         0.5,
                         0.5,
@@ -6545,12 +6674,20 @@ class MainWindow(QMainWindow):
                         ha="center",
                         va="center",
                         transform=ax.transAxes,
-                        fontsize=18,
+                        fontsize=self._plot_font_sizes()["message"],
                     )
                     ax.axis("off")
                 else:
+                    shared_overlay_ax = None
                     for idx, (family, channels) in enumerate(families, start=1):
-                        ax = self.figure.add_subplot(len(families), 1, idx)
+                        ax = self.figure.add_subplot(
+                            len(families),
+                            1,
+                            idx,
+                            sharex=shared_overlay_ax if same_time_scale else None,
+                        )
+                        if shared_overlay_ax is None:
+                            shared_overlay_ax = ax
                         axes.append(ax)
                         plotted_any = False
                         for channel in channels:
@@ -6560,6 +6697,7 @@ class MainWindow(QMainWindow):
                 ordered = [ch for ch in CHANNEL_ORDER if ch in selected]
                 if not ordered:
                     ax = self.figure.add_subplot(111)
+                    self._current_axis_count = 1
                     ax.text(
                         0.5,
                         0.5,
@@ -6567,13 +6705,18 @@ class MainWindow(QMainWindow):
                         ha="center",
                         va="center",
                         transform=ax.transAxes,
-                        fontsize=18,
+                        fontsize=self._plot_font_sizes()["message"],
                     )
                     ax.axis("off")
                 else:
                     grid = self.figure.add_gridspec(len(ordered), 1, hspace=0.00)
+                    shared_axes: Dict[str, Any] = {}
                     for idx, channel in enumerate(ordered):
-                        ax = self.figure.add_subplot(grid[idx, 0])
+                        family = CHANNEL_DEFS[channel].family
+                        share_key = "__all__" if same_time_scale else family
+                        ax = self.figure.add_subplot(grid[idx, 0], sharex=shared_axes.get(share_key))
+                        if share_key not in shared_axes:
+                            shared_axes[share_key] = ax
                         axes.append(ax)
                         plotted_any = self._plot_channel(ax, event_name, channel, overlay_mode=False, missing_channels=missing)
                         next_family = None
@@ -6684,8 +6827,9 @@ class MainWindow(QMainWindow):
             return f"{numeric:.2f}"
 
         twin.xaxis.set_major_formatter(FuncFormatter(_format))
-        twin.set_xlabel(TIME_AXIS_LABEL, fontsize=14)
-        twin.tick_params(axis="x", labelsize=12, width=1.2, length=6)
+        font_sizes = self._plot_font_sizes()
+        twin.set_xlabel(TIME_AXIS_LABEL, fontsize=font_sizes["twin_label"])
+        twin.tick_params(axis="x", labelsize=font_sizes["twin_tick"], width=1.2, length=6)
         twin.set_navigate(False)
         twin.patch.set_visible(False)
         for spine in twin.spines.values():
@@ -6743,7 +6887,7 @@ class MainWindow(QMainWindow):
                     values = np.asarray(self._apply_plot_scale(channel, y[:n]), dtype=float)
                     x_values = times
                     context: Optional[MassAxisContext] = None
-                    if channel == "TOF Combined" and not overlay_mode:
+                    if channel == "TOF Combined" and not overlay_mode and not self._same_time_scale_enabled():
                         context = self._compute_combined_mass_axis(event_name, times)
                         if context is not None and context.mass.size and values.size:
                             m = min(context.mass.size, values.size)
@@ -6777,7 +6921,7 @@ class MainWindow(QMainWindow):
         if base_plotted or fit_plotted:
             self._plot_trigger_level(ax, event_name, channel)
             if not overlay_mode:
-                ax.set_ylabel(y_label_with_units(channel), fontsize=16)
+                ax.set_ylabel(y_label_with_units(channel), fontsize=self._plot_font_sizes()["label"])
             return True
 
         if reason:
@@ -6987,35 +7131,50 @@ class MainWindow(QMainWindow):
         return plotted
 
     def _style_overlay_axis(self, ax, family: str, bottom: bool):
+        font_sizes = self._plot_font_sizes()
         ax.set_facecolor("#f8f9fb")
         ax.grid(True, alpha=0.35)
-        ax.tick_params(axis="both", labelsize=14, width=1.5, length=7)
-        ax.set_ylabel(FAMILY_YLABELS.get(family, "Channel"), fontsize=16)
-        show_x = bottom or family == FAMILY_HIGH
+        ax.tick_params(axis="both", labelsize=font_sizes["tick"], width=1.5, length=7)
+        ax.set_ylabel(FAMILY_YLABELS.get(family, "Channel"), fontsize=font_sizes["label"])
+        show_x = bottom
+        ax.tick_params(axis="x", labelbottom=show_x)
         if show_x:
-            ax.set_xlabel(TIME_AXIS_LABEL, fontsize=16)
+            ax.set_xlabel(TIME_AXIS_LABEL, fontsize=font_sizes["label"])
         else:
             ax.set_xlabel("")
 
     def _style_single_axis(self, ax, channel: str, bottom: bool, next_family: Optional[str]):
+        font_sizes = self._plot_font_sizes()
         ax.set_facecolor("#f8f9fb")
         ax.grid(True, alpha=0.35)
-        ax.tick_params(axis="both", labelsize=14, width=1.5, length=7)
+        ax.tick_params(axis="both", labelsize=font_sizes["tick"], width=1.5, length=7)
         current_family = CHANNEL_DEFS.get(channel)
         family_name = current_family.family if current_family else None
-        show_x = bottom or (next_family is not None and next_family != family_name)
+        if self._same_time_scale_enabled():
+            show_x = bottom
+        else:
+            show_x = bottom or (next_family is not None and next_family != family_name)
+        ax.tick_params(axis="x", labelbottom=show_x)
         custom_label = getattr(ax, "_custom_xlabel", None)
         if show_x:
             if custom_label:
-                ax.set_xlabel(custom_label, fontsize=16)
+                ax.set_xlabel(custom_label, fontsize=font_sizes["label"])
             else:
-                ax.set_xlabel(TIME_AXIS_LABEL, fontsize=16)
+                ax.set_xlabel(TIME_AXIS_LABEL, fontsize=font_sizes["label"])
         else:
             ax.set_xlabel("")
 
     def _draw_missing_message(self, ax, channel: str, reason: str):
         ax.set_facecolor("#f8f9fb")
-        ax.text(0.5, 0.5, f"{channel}\n{reason}", ha="center", va="center", transform=ax.transAxes, fontsize=16)
+        ax.text(
+            0.5,
+            0.5,
+            f"{channel}\n{reason}",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=self._plot_font_sizes()["message"],
+        )
         ax.set_xticks([])
         ax.set_yticks([])
         ax.set_frame_on(False)
