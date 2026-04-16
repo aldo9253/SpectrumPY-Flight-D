@@ -5778,6 +5778,12 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "canvas") or not hasattr(self, "figure"):
             return
         self._update_canvas_geometry(getattr(self, "_current_axis_count", 1))
+        if self._compact_plots_enabled():
+            try:
+                self.canvas.draw()
+            except Exception:
+                pass
+            self._update_compact_y_label_layout()
         self.canvas.draw_idle()
 
     def _bind_plot_resize_signals(self) -> None:
@@ -5839,6 +5845,82 @@ class MainWindow(QMainWindow):
             "twin_tick": 12,
             "message": 16,
         }
+
+    def _update_compact_y_label_layout(self) -> None:
+        """Adjust compact y-labels so stacked plots remain readable on small screens."""
+
+        if not self._compact_plots_enabled() or not hasattr(self, "canvas") or not hasattr(self, "figure"):
+            return
+
+        try:
+            renderer = self.canvas.get_renderer()
+        except Exception:
+            return
+
+        figure_bbox = getattr(self.figure, "bbox", None)
+        if figure_bbox is None:
+            return
+
+        base_font = max(int(self._plot_font_sizes()["label"]), 1)
+        min_font = max(7, base_font - 4)
+
+        for ax in self.figure.axes:
+            label = ax.yaxis.get_label()
+            if not ax.get_visible() or label is None or not label.get_text():
+                continue
+
+            try:
+                axis_bbox = ax.get_window_extent(renderer=renderer)
+            except Exception:
+                continue
+            if axis_bbox.width <= 0 or axis_bbox.height <= 0:
+                continue
+
+            available_height = max(float(axis_bbox.height) - 6.0, 0.0)
+            available_width = max(float(axis_bbox.x0 - figure_bbox.x0) - 8.0, 0.0)
+            if available_height <= 0 or available_width <= 0:
+                continue
+
+            candidates: List[Tuple[int, int, int]] = []
+            candidates.extend((90, size, 4) for size in range(base_font, min_font - 1, -1))
+            candidates.extend((0, size, 2) for size in range(base_font, min_font - 1, -1))
+
+            chosen_rotation, chosen_size, chosen_pad = candidates[-1]
+            for rotation, size, labelpad in candidates:
+                label.set_rotation(rotation)
+                label.set_fontsize(size)
+                ax.yaxis.labelpad = labelpad
+                label.set_rotation_mode("anchor")
+                if rotation == 0:
+                    label.set_horizontalalignment("right")
+                    label.set_verticalalignment("center")
+                else:
+                    label.set_horizontalalignment("center")
+                    label.set_verticalalignment("bottom")
+
+                try:
+                    label_bbox = label.get_window_extent(renderer=renderer)
+                except Exception:
+                    continue
+
+                if rotation == 90:
+                    fits = label_bbox.height <= available_height and label_bbox.width <= available_width
+                else:
+                    fits = label_bbox.width <= available_width and label_bbox.height <= available_height
+                if fits:
+                    chosen_rotation, chosen_size, chosen_pad = rotation, size, labelpad
+                    break
+
+            label.set_rotation(chosen_rotation)
+            label.set_fontsize(chosen_size)
+            ax.yaxis.labelpad = chosen_pad
+            label.set_rotation_mode("anchor")
+            if chosen_rotation == 0:
+                label.set_horizontalalignment("right")
+                label.set_verticalalignment("center")
+            else:
+                label.set_horizontalalignment("center")
+                label.set_verticalalignment("bottom")
 
     def _on_compact_plots_toggled(self, checked: bool) -> None:
         self._compact_plot_mode = bool(checked)
@@ -7234,6 +7316,11 @@ class MainWindow(QMainWindow):
         self._update_canvas_geometry(axis_count)
         self._stats_axes = axes
         self._set_stats_selector_active(self._stats_selector_active)
+        try:
+            self.canvas.draw()
+        except Exception:
+            pass
+        self._update_compact_y_label_layout()
         self.canvas.draw_idle()
         self.update_status_text(missing)
 
