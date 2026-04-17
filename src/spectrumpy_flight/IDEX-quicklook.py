@@ -164,7 +164,7 @@ try:
         QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
         QCheckBox, QDialogButtonBox, QMenu, QMenuBar, QToolButton, QTextBrowser, QTextEdit,
         QListWidget, QListWidgetItem, QLineEdit, QWidgetAction, QStyle, QSplitter,
-        QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget
+        QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget, QProgressDialog
     )
     _QT = "PySide6"
 except Exception:
@@ -186,7 +186,7 @@ except Exception:
         QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
         QCheckBox, QDialogButtonBox, QMenu, QMenuBar, QToolButton, QTextBrowser, QTextEdit,
         QListWidget, QListWidgetItem, QLineEdit, QWidgetAction, QStyle, QSplitter,
-        QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget
+        QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget, QProgressDialog
     )
     _QT = "PyQt6"
 
@@ -4747,6 +4747,7 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(logo_path)))
 
         self._data_source: Optional[BaseDataSource] = None
+        self._all_events: List[str] = []
         self._events: List[str] = []
         self._current_event: Optional[str] = None
         self._filename: Optional[str] = None
@@ -4782,6 +4783,8 @@ class MainWindow(QMainWindow):
         self._dust_bridge_files: Dict[int, Tuple[Any, str]] = {}
         self._documentation_center: Optional[DocumentationCenter] = None
         self._event_data_dialog: Optional[EventDataDialog] = None
+        self._interesting_event_matches: List[str] = []
+        self._interesting_event_filter_active = False
 
         self._create_actions()
 
@@ -5668,6 +5671,26 @@ class MainWindow(QMainWindow):
         fit_row_widgets.append(self.noise_button)
         control_buttons.append(self.noise_button)
 
+        self.interesting_events_button = QPushButton("Interesting Events", self)
+        self.interesting_events_button.setMinimumHeight(32)
+        self.interesting_events_button.setStyleSheet(action_style)
+        self.interesting_events_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.interesting_events_button.setToolTip(
+            "Filter to events with multiple threshold-crossing TOF peaks or a TOF crossing lasting at least 0.5 us."
+        )
+        self.interesting_events_button.clicked.connect(self.apply_interesting_event_filter)
+        fit_row_widgets.append(self.interesting_events_button)
+        control_buttons.append(self.interesting_events_button)
+
+        self.reset_event_filter_button = QPushButton("Reset Event Filter", self)
+        self.reset_event_filter_button.setMinimumHeight(32)
+        self.reset_event_filter_button.setStyleSheet(action_style)
+        self.reset_event_filter_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.reset_event_filter_button.setToolTip("Restore the full event list.")
+        self.reset_event_filter_button.clicked.connect(self.reset_event_filter)
+        fit_row_widgets.append(self.reset_event_filter_button)
+        control_buttons.append(self.reset_event_filter_button)
+
         self.compact_plots_button = QPushButton("Compact Plots", self)
         self.compact_plots_button.setCheckable(True)
         self.compact_plots_button.setChecked(self._compact_plot_mode)
@@ -5748,6 +5771,217 @@ class MainWindow(QMainWindow):
                 self.edit_params_button.setToolTip("Open the fit-parameter editor for this event.")
             else:
                 self.edit_params_button.setToolTip("No editable fit parameters were found for this event.")
+
+    def _update_event_combo_items(
+        self,
+        events: Sequence[str],
+        *,
+        preferred_event: Optional[str] = None,
+    ) -> None:
+        selected_event = preferred_event if preferred_event in events else None
+        if selected_event is None and self._current_event in events:
+            selected_event = self._current_event
+
+        self.event_combo.blockSignals(True)
+        self.event_combo.clear()
+        self.event_combo.addItems(list(events))
+        if selected_event is not None:
+            self.event_combo.setCurrentIndex(list(events).index(selected_event))
+        self.event_combo.blockSignals(False)
+
+    def _update_interesting_event_button_states(self) -> None:
+        has_data = bool(self._data_source and self._all_events)
+        has_matches = bool(self._interesting_event_matches)
+
+        if hasattr(self, "interesting_events_button"):
+            self.interesting_events_button.setEnabled(has_data)
+            if not has_data:
+                self.interesting_events_button.setToolTip("Open a data file to scan for interesting events.")
+            elif self._interesting_event_filter_active:
+                self.interesting_events_button.setToolTip(
+                    f"Interesting-event filter active ({len(self._interesting_event_matches)} matches)."
+                )
+            elif has_matches:
+                self.interesting_events_button.setToolTip(
+                    f"Filter to {len(self._interesting_event_matches)} TOF events with multiple peaks or >= 0.5 us threshold crossings."
+                )
+            else:
+                self.interesting_events_button.setToolTip(
+                    "Filter to events with multiple threshold-crossing TOF peaks or a TOF crossing lasting at least 0.5 us."
+                )
+
+        if hasattr(self, "reset_event_filter_button"):
+            self.reset_event_filter_button.setEnabled(has_data and self._interesting_event_filter_active)
+            if self._interesting_event_filter_active:
+                self.reset_event_filter_button.setToolTip("Restore the full event list.")
+            else:
+                self.reset_event_filter_button.setToolTip("The full event list is already active.")
+
+    def _interesting_event_metrics_for_channel(self, event: str, channel: str) -> Optional[Tuple[int, float]]:
+        if not self._data_source:
+            return None
+
+        threshold = _guess_trigger_level_for_channel(self._data_source, event, channel)
+        if threshold is None or not np.isfinite(threshold):
+            return None
+
+        values, times = self._resolve_channel_data(event, channel)
+        if values is None or times is None:
+            return None
+
+        try:
+            value_array = np.asarray(self._apply_plot_scale(channel, _to_1d(values)), dtype=float)
+            time_array = np.asarray(_to_1d(times), dtype=float)
+        except Exception:
+            return None
+
+        count = min(value_array.size, time_array.size)
+        if count < 2:
+            return None
+
+        value_array = value_array[:count]
+        time_array = time_array[:count]
+        finite = np.isfinite(value_array) & np.isfinite(time_array)
+        if not np.any(finite):
+            return None
+
+        value_array = value_array[finite]
+        time_array = time_array[finite]
+        if value_array.size < 2 or time_array.size < 2:
+            return None
+
+        above = value_array >= float(threshold)
+        if not np.any(above):
+            return 0, 0.0
+
+        transitions = np.diff(np.concatenate(([0], above.astype(np.int8), [0])))
+        starts = np.flatnonzero(transitions == 1)
+        ends = np.flatnonzero(transitions == -1)
+        if starts.size == 0 or ends.size == 0:
+            return 0, 0.0
+
+        peak_count = int(min(starts.size, ends.size))
+        longest_duration = 0.0
+        for start, end in zip(starts, ends):
+            if end <= start:
+                continue
+            stop_index = min(end - 1, time_array.size - 1)
+            start_index = min(start, time_array.size - 1)
+            duration = float(time_array[stop_index] - time_array[start_index])
+            if np.isfinite(duration):
+                longest_duration = max(longest_duration, max(duration, 0.0))
+
+        return peak_count, longest_duration
+
+    def _is_interesting_event(self, event: str) -> bool:
+        for channel in ("TOF L", "TOF M", "TOF H"):
+            metrics = self._interesting_event_metrics_for_channel(event, channel)
+            if metrics is None:
+                continue
+            peak_count, longest_duration = metrics
+            if peak_count >= 2 or longest_duration >= 0.5:
+                return True
+        return False
+
+    def _compute_interesting_event_matches(self, progress: Optional[QProgressDialog] = None) -> Optional[List[str]]:
+        if not self._data_source:
+            return []
+        matches: List[str] = []
+        total = len(self._all_events)
+        for index, event in enumerate(self._all_events, start=1):
+            if progress is not None:
+                progress.setLabelText(
+                    f"Scanning event {index} of {total} for multiple TOF peaks and extended threshold crossings..."
+                )
+                progress.setValue(index - 1)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    return None
+            try:
+                if self._is_interesting_event(event):
+                    matches.append(event)
+            except Exception:
+                continue
+        if progress is not None:
+            progress.setValue(total)
+        return matches
+
+    def apply_interesting_event_filter(self) -> None:
+        if not self._data_source or not self._all_events:
+            QMessageBox.information(
+                self,
+                "No File Loaded",
+                "Open a data file before scanning for interesting events.",
+            )
+            return
+
+        self.statusBar().showMessage("Scanning events for multiple TOF peaks and >= 0.5 us threshold crossings...")
+        progress = QProgressDialog(
+            "Scanning events for multiple TOF peaks and extended threshold crossings...",
+            "Cancel",
+            0,
+            len(self._all_events),
+            self,
+        )
+        progress.setWindowTitle("Finding Interesting Events")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        matches = self._compute_interesting_event_matches(progress)
+        progress.close()
+
+        if matches is None:
+            self._interesting_event_filter_active = False
+            self._update_interesting_event_button_states()
+            self.statusBar().showMessage("Interesting-event scan canceled.", 5000)
+            return
+
+        self._interesting_event_matches = list(matches)
+
+        if not matches:
+            self._interesting_event_filter_active = False
+            self._update_interesting_event_button_states()
+            QMessageBox.information(
+                self,
+                "Interesting Events",
+                "No events matched the interesting-event criteria.",
+            )
+            self.statusBar().showMessage("No events matched the interesting-event criteria.", 6000)
+            return
+
+        current_event = self._current_event if self._current_event in matches else matches[0]
+        self._events = list(matches)
+        self._interesting_event_filter_active = True
+        self._update_event_combo_items(self._events, preferred_event=current_event)
+        self._update_interesting_event_button_states()
+
+        if current_event:
+            self.plot_event(current_event)
+
+        self.statusBar().showMessage(
+            f"Interesting-event filter active: {len(matches)} of {len(self._all_events)} events matched.",
+            7000,
+        )
+
+    def reset_event_filter(self) -> None:
+        if not self._all_events:
+            return
+
+        current_event = self._current_event if self._current_event in self._all_events else self._all_events[0]
+        self._events = list(self._all_events)
+        self._interesting_event_filter_active = False
+        self._update_event_combo_items(self._events, preferred_event=current_event)
+        self._update_interesting_event_button_states()
+
+        if current_event:
+            self.plot_event(current_event)
+
+        self.statusBar().showMessage("Restored the full event list.", 5000)
 
     def _has_editable_fit_parameters(self, event_name: Optional[str]) -> bool:
         if not event_name or not self._data_source:
@@ -6879,9 +7113,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._data_source = None
+        self._all_events = []
         self._filename = None
         self._events = []
         self._current_event = None
+        self._interesting_event_matches = []
+        self._interesting_event_filter_active = False
         self._fit_cache.clear()
         self._fit_param_overrides.clear()
         self._fit_fixed_overrides.clear()
@@ -6896,6 +7133,7 @@ class MainWindow(QMainWindow):
         self.event_combo.clear()
         self.event_combo.blockSignals(False)
         self._update_viewer_action_states()
+        self._update_interesting_event_button_states()
         self._set_edit_fit_controls_enabled(False)
 
     def _get_dataset(self, event: str, dataset: str) -> Optional[np.ndarray]:
@@ -7137,12 +7375,12 @@ class MainWindow(QMainWindow):
         events = source.list_events()
         if not events:
             QMessageBox.warning(self, "No Events", "No top-level event groups found in this file.")
-        self._events = events
-
-        self.event_combo.blockSignals(True)
-        self.event_combo.clear()
-        self.event_combo.addItems(self._events)
-        self.event_combo.blockSignals(False)
+        self._all_events = list(events)
+        self._events = list(events)
+        self._interesting_event_matches = []
+        self._interesting_event_filter_active = False
+        self._update_event_combo_items(self._events)
+        self._update_interesting_event_button_states()
 
         target_event = None
         if preferred_event and preferred_event in self._events:
