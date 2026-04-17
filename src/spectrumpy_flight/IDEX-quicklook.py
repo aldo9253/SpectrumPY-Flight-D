@@ -257,8 +257,7 @@ def prompt_for_data_file(
         if preferred and (target_dir := preferred_map.get(preferred.lower())) and target_dir.exists():
             start_dir = str(target_dir)
         else:
-            default_dir = hdf5_dir if hdf5_dir.exists() else repo_root
-            start_dir = str(default_dir)
+            start_dir = str(repo_root)
 
     options = QFileDialog.Option.DontUseNativeDialog | QFileDialog.Option.ReadOnly
 
@@ -1446,12 +1445,23 @@ def _event_data_shape_text(value: Any) -> str:
 
 
 _AID_DATASETS = (
+    "Metadata/unpacked/IDX__TXHDRFSWAIDCOPY",
+    "Metadata/unpacked/TXHDRFSWAIDCOPY",
+    "Metadata/packed/IDX__TXHDRFSWAIDCOPY",
+    "Metadata/packed/TXHDRFSWAIDCOPY",
+    "Metadata/raw/IDX__TXHDRFSWAIDCOPY",
+    "Metadata/raw/TXHDRFSWAIDCOPY",
+    "IDX__TXHDRFSWAIDCOPY",
+    "TXHDRFSWAIDCOPY",
     "Metadata/unpacked/IDX__SCI0AID",
     "Metadata/unpacked/SCI0AID",
+    "Metadata/packed/IDX__SCI0AID",
+    "Metadata/packed/SCI0AID",
     "Metadata/raw/IDX__SCI0AID",
     "Metadata/raw/SCI0AID",
     "IDX__SCI0AID",
     "SCI0AID",
+    "aid",
 )
 
 
@@ -1465,11 +1475,40 @@ def _get_event_aid(data_source: "BaseDataSource | None", event: Optional[str]) -
             if aid is not None:
                 return aid
     attrs = data_source.get_event_attributes(event)
-    for key in ("IDX__SCI0AID", "SCI0AID"):
+    for key in ("IDX__TXHDRFSWAIDCOPY", "TXHDRFSWAIDCOPY", "IDX__SCI0AID", "SCI0AID", "aid"):
         if key in attrs:
             aid = _normalise_scalar(attrs[key])
             if aid is not None:
                 return aid
+    try:
+        metadata_rows = data_source.event_metadata_rows(event)
+    except Exception:
+        metadata_rows = []
+    for name, value, _shape in metadata_rows:
+        normalized_name = str(name).strip().lower()
+        if normalized_name not in {
+            "metadata/unpacked/idx__txhdrfswaidcopy",
+            "metadata/unpacked/txhdrfswaidcopy",
+            "metadata/packed/idx__txhdrfswaidcopy",
+            "metadata/packed/txhdrfswaidcopy",
+            "metadata/raw/idx__txhdrfswaidcopy",
+            "metadata/raw/txhdrfswaidcopy",
+            "idx__txhdrfswaidcopy",
+            "txhdrfswaidcopy",
+            "metadata/unpacked/idx__sci0aid",
+            "metadata/unpacked/sci0aid",
+            "metadata/packed/idx__sci0aid",
+            "metadata/packed/sci0aid",
+            "metadata/raw/idx__sci0aid",
+            "metadata/raw/sci0aid",
+            "idx__sci0aid",
+            "sci0aid",
+            "aid",
+        }:
+            continue
+        aid = _normalise_scalar(value)
+        if aid is not None:
+            return aid
     return None
 
 
@@ -2355,6 +2394,8 @@ class CDFDataSource(BaseDataSource):
     DIRECT_GENERIC_TRIGGER_MODE_VARS: Tuple[str, ...] = ("triggermode",)
     DIRECT_TRIGGER_ORIGIN_VARS: Tuple[str, ...] = ("trigger_origin",)
     RAW_TRIGGER_ID_VARS: Tuple[str, ...] = ("idx__txhdrtrigid",)
+    DIRECT_AID_VARS: Tuple[str, ...] = ("idx__sci0aid", "sci0aid", "aid")
+    DIRECT_AID_COPY_VARS: Tuple[str, ...] = ("idx__txhdrfswaidcopy", "txhdrfswaidcopy")
 
     RAW_TRIGGER_LEVEL_SCALES: Dict[str, float] = {
         "TOF H": 2.89e-4,
@@ -2779,6 +2820,10 @@ class CDFDataSource(BaseDataSource):
             return self._combined_signal(event)
         if dataset_name == "Analysis/DustComposition/CombinedTime":
             return self._combined_time(event)
+        if dataset_name in {"IDX__SCI0AID", "SCI0AID"}:
+            return self._wrap_dataset_value(self._event_value(event, self.DIRECT_AID_VARS))
+        if dataset_name in {"IDX__TXHDRFSWAIDCOPY", "TXHDRFSWAIDCOPY"}:
+            return self._wrap_dataset_value(self._event_value(event, self.DIRECT_AID_COPY_VARS))
         if dataset_name in self.SYNTHETIC_TRIGGER_ORIGIN_ALIASES:
             return self._wrap_dataset_value(self._trigger_origin_text(event))
         if dataset_name in self.SYNTHETIC_GENERIC_TRIGGER_LEVEL_ALIASES:
