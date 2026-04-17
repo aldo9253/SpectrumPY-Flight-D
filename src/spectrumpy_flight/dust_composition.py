@@ -38,7 +38,11 @@ import h5py
 import numpy as np
 
 from matplotlib.collections import PathCollection
+from scipy.integrate import quad
 from scipy.interpolate import CubicSpline
+from scipy.optimize import curve_fit
+from scipy.signal import find_peaks
+from scipy.stats import exponnorm
 
 try:  # pragma: no cover - Qt import guard
     from PySide6.QtCore import Qt
@@ -185,6 +189,15 @@ MIN_MASS_STRETCH = 1.3
 MAX_MASS_STRETCH = 1.6
 
 CALIBRATION_MAX_ORDER = 4
+L2A_REFERENCE_MASS_FILE = "atomic_masses.csv"
+L2A_STRETCH_MIN_US = 1.4
+L2A_STRETCH_MAX_US = 1.5
+L2A_STRETCH_STEPS = 10
+L2A_PEAK_PROMINENCE = 0.01
+L2A_PEAK_HALF_WINDOW = 5
+L2A_MASS_DIM = 500
+PLOT_LOG_FLOOR = 1.0e-12
+EMG_FIT_HALF_WINDOW_US = 0.5
 
 
 def _clamp_mass_stretch(value: float) -> float:
@@ -199,6 +212,209 @@ BASELINE_ANCHORS_DATASET = "BaselineAnchors"
 ANALYSIS_GROUP = "Analysis"
 DUST_GROUP = "DustComposition"
 MASS_LINES_DATASET = "MassLines"
+
+
+def _load_l2a_reference_masses() -> np.ndarray:
+    """Load the local copy of the L2A reference mass comb."""
+
+    path = Path(__file__).with_name(L2A_REFERENCE_MASS_FILE)
+    masses: List[float] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                mass = float(row.get("Mass", ""))
+            except Exception:
+                continue
+            if math.isfinite(mass) and mass >= 0.0:
+                masses.append(mass)
+    if not masses:
+        raise ValueError(f"No valid reference masses found in {path}")
+    return np.asarray(masses, dtype=float)
+
+
+def _l2a_chi_square(observed: np.ndarray, expected: np.ndarray, num_params: int) -> tuple[float, float]:
+    """Return the L2A-style chi-square and reduced chi-square."""
+
+    residuals = np.asarray(observed, dtype=float) - np.asarray(expected, dtype=float)
+    chisqr = float(np.sum(residuals ** 2))
+    redchi = chisqr / max(1, (len(residuals) - int(num_params)))
+    return chisqr, redchi
+
+
+def _fit_l2a_emg_peak(
+    peak_time: np.ndarray,
+    peak_signal: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    """Fit ``baseline + EMG`` to a local TOF peak in the time domain."""
+
+    times = np.asarray(peak_time, dtype=float)
+    signal = np.asarray(peak_signal, dtype=float)
+    if times.size < 3 or signal.size != times.size or not np.any(np.isfinite(signal)):
+        return np.full(5, np.nan, dtype=float), np.nan, np.nan
+
+    mu = float(times[int(np.nanargmax(signal))])
+    sigma = max(float(np.nanstd(times)) / 4.0, 1.0e-6)
+    duration = max(float(times[-1] - times[0]), 1.0e-9)
+    lam = max(1.0 / duration, 1.0e-6)
+    amplitude = float(np.trapz(np.clip(signal - np.nanmedian(signal), 0.0, None), times))
+    if not math.isfinite(amplitude) or amplitude <= 0.0:
+        amplitude = max(float(np.nanmax(signal) - np.nanmedian(signal)) * duration, 1.0e-9)
+    baseline = float(np.nanmedian(np.concatenate((signal[:2], signal[-2:]))))
+    p0 = [baseline, amplitude, mu, sigma, lam]
+
+    try:
+        params, _ = curve_fit(
+            lambda t, baseline_offset, area, mu_value, sigma_value, lam_value: baseline_offset
+            + _emg_model(t, area, mu_value, abs(sigma_value), abs(lam_value)),
+            times,
+            signal,
+            p0=p0,
+            maxfev=100_000,
+        )
+    except Exception:
+        return np.full(len(p0), np.nan, dtype=float), np.nan, np.nan
+
+    expected = params[0] + _emg_model(times, params[1], params[2], abs(params[3]), abs(params[4]))
+    chisqr, redchi = _l2a_chi_square(signal, expected, len(p0))
+    return np.asarray(params, dtype=float), chisqr, redchi
+
+
+def _l2a_area_under_emg(time_slice: np.ndarray, params: np.ndarray) -> float:
+    """Return the EMG-only area for a ``baseline + EMG`` fit."""
+
+    if np.asarray(params, dtype=float).size < 2 or np.any(~np.isfinite(params)):
+        return 0.0
+    return max(float(np.asarray(params, dtype=float)[1]), 0.0)
+
+
+def _time_window_around_peak(time_axis: np.ndarray, center_time: float, half_window_us: float) -> np.ndarray:
+    """Return a boolean mask for a fixed-width time-domain fitting window."""
+
+    times = np.asarray(time_axis, dtype=float)
+    if times.size == 0 or not math.isfinite(center_time):
+        return np.zeros(times.shape, dtype=bool)
+    window = max(abs(float(half_window_us)), 1.0e-9)
+    return np.isfinite(times) & (np.abs(times - center_time) <= window)
+
+
+def _dynamic_time_window_for_peak(
+    time_axis: np.ndarray,
+    signal: np.ndarray,
+    peak_indices: np.ndarray,
+    peak_index: int,
+    *,
+    max_half_window_us: float,
+    min_window_us: float = 0.15,
+) -> tuple[np.ndarray, float, float]:
+    """Return a neighbor-aware fit mask and window bounds for a given peak index."""
+
+    times = np.asarray(time_axis, dtype=float).ravel()
+    values = np.asarray(signal, dtype=float).ravel()
+    peaks = np.asarray(peak_indices, dtype=int).ravel()
+    length = min(times.size, values.size)
+    if length == 0:
+        return np.zeros(0, dtype=bool), float("nan"), float("nan")
+    times = times[:length]
+    values = values[:length]
+    peaks = peaks[(peaks >= 0) & (peaks < length)]
+    if peaks.size == 0 or not (0 <= int(peak_index) < length):
+        return np.zeros(length, dtype=bool), float("nan"), float("nan")
+
+    peak_index = int(peak_index)
+    center_time = float(times[peak_index])
+    max_half = max(abs(float(max_half_window_us)), 1.0e-9)
+    min_width = max(abs(float(min_window_us)), 1.0e-6)
+
+    try:
+        position = int(np.where(peaks == peak_index)[0][0])
+    except Exception:
+        position = int(np.argmin(np.abs(peaks - peak_index)))
+
+    left_time = center_time - max_half
+    right_time = center_time + max_half
+
+    if position > 0:
+        left_peak = int(peaks[position - 1])
+        midpoint = 0.5 * (float(times[left_peak]) + center_time)
+        valley_index = left_peak + int(np.argmin(values[left_peak : peak_index + 1]))
+        valley_time = float(times[valley_index])
+        left_time = max(left_time, midpoint, valley_time)
+
+    if position < peaks.size - 1:
+        right_peak = int(peaks[position + 1])
+        midpoint = 0.5 * (center_time + float(times[right_peak]))
+        valley_index = peak_index + int(np.argmin(values[peak_index : right_peak + 1]))
+        valley_time = float(times[valley_index])
+        right_time = min(right_time, midpoint, valley_time)
+
+    if not math.isfinite(left_time):
+        left_time = center_time - max_half
+    if not math.isfinite(right_time):
+        right_time = center_time + max_half
+
+    if right_time - left_time < min_width:
+        half = 0.5 * min_width
+        left_time = center_time - half
+        right_time = center_time + half
+        if position > 0:
+            left_peak = int(peaks[position - 1])
+            midpoint = 0.5 * (float(times[left_peak]) + center_time)
+            left_time = max(left_time, midpoint)
+        if position < peaks.size - 1:
+            right_peak = int(peaks[position + 1])
+            midpoint = 0.5 * (center_time + float(times[right_peak]))
+            right_time = min(right_time, midpoint)
+        if right_time <= left_time:
+            left_time = center_time - max_half
+            right_time = center_time + max_half
+
+    mask = np.isfinite(times) & (times >= left_time) & (times <= right_time)
+    return mask, float(left_time), float(right_time)
+
+
+def _l2a_mass_calibration(
+    tof_signal: np.ndarray,
+    time_axis: np.ndarray,
+    reference_masses: np.ndarray,
+) -> tuple[TOFMassCal, np.ndarray, float, float]:
+    """Replicate the L2A stretch/shift search using a reference mass comb."""
+
+    signal = np.asarray(tof_signal, dtype=float).ravel()
+    times = np.asarray(time_axis, dtype=float).ravel()
+    length = min(signal.size, times.size)
+    if length < 8:
+        raise ValueError("Need at least 8 TOF samples to estimate the mass calibration.")
+    signal = signal[:length]
+    times = times[:length]
+
+    zeroed_time = times - float(times[0])
+    sample_dt = float(np.nanmedian(np.diff(zeroed_time))) if zeroed_time.size >= 2 else 0.0
+    if not math.isfinite(sample_dt) or sample_dt <= 0.0:
+        raise ValueError("Unable to determine the TOF sample spacing for mass calibration.")
+
+    stretches = np.linspace(L2A_STRETCH_MIN_US, L2A_STRETCH_MAX_US, L2A_STRETCH_STEPS)
+    shift_samples = np.zeros(stretches.size, dtype=float)
+    correlations = np.zeros(stretches.size, dtype=float)
+
+    for stretch_index, stretch_us in enumerate(stretches):
+        comb = np.zeros(length, dtype=float)
+        expected_times = stretch_us * np.sqrt(reference_masses)
+        for expected_time in expected_times:
+            idx = int(np.argmin(np.abs(zeroed_time - expected_time)))
+            if 0 <= idx < length:
+                comb[idx] = 1.0
+        cross_correlation = np.correlate(comb, signal, mode="full")
+        middle = length - 1
+        shift_samples[stretch_index] = float(np.argmax(cross_correlation) - middle)
+        correlations[stretch_index] = float(np.max(cross_correlation))
+
+    best_index = int(np.argmax(correlations))
+    best_shift_us = float(shift_samples[best_index] * sample_dt)
+    best_stretch_us = float(stretches[best_index])
+    calibration = TOFMassCal(np.asarray([best_shift_us, best_stretch_us], dtype=float), mass_range_u=(0.0, 500.0))
+    mass_scale = calibration.tof_to_mass(zeroed_time)
+    return calibration, mass_scale, best_shift_us, best_stretch_us
 
 
 @dataclass(frozen=True)
@@ -593,6 +809,7 @@ def _estimate_amplitude_from_curve(time_axis: np.ndarray, fit_values: np.ndarray
 
     if time_axis.size == 0 or fit_values.size == 0:
         return 0.0
+    values = np.asarray(fit_values, dtype=float) - float(getattr(line, "baseline_offset", 0.0))
     unit_model = _evaluate_line_shape(
         line.shape,
         time_axis,
@@ -603,10 +820,10 @@ def _estimate_amplitude_from_curve(time_axis: np.ndarray, fit_values: np.ndarray
         line.extra_params,
     )
     with np.errstate(divide="ignore", invalid="ignore"):
-        mask = np.isfinite(unit_model) & np.isfinite(fit_values) & (unit_model > 0)
+        mask = np.isfinite(unit_model) & np.isfinite(values) & (unit_model > 0)
         if not np.any(mask):
             return 0.0
-        ratios = fit_values[mask] / unit_model[mask]
+        ratios = values[mask] / unit_model[mask]
     ratios = ratios[np.isfinite(ratios)]
     if ratios.size == 0:
         return 0.0
@@ -848,11 +1065,9 @@ def combine_waveform_channels(
 
     corrected_channels: List[Dict[str, Any]] = []
     for name, arr in channel_entries:
-        baseline = _first_microsecond_mean(arr, times)
-        corrected = arr - baseline
         gain = float(gain_map.get(name, 1.0))
         scale = target_gain / gain if gain else 1.0
-        scaled = corrected * scale
+        scaled = arr * scale
         saturation = detect_saturation(arr, times)
         corrected_channels.append(
             {
@@ -935,26 +1150,23 @@ def combine_mid_low_waveforms(
     mid_arr = mid_arr[:length]
     low_arr = low_arr[:length]
 
-    mid_baseline_sub, _ = _median_baseline_subtract(mid_arr)
-    low_baseline_sub, _ = _median_baseline_subtract(low_arr)
-
     gain_map = gain_map or GAIN_MAP
     mid_gain = float(gain_map.get("TOF M", GAIN_MEDIUM))
     low_gain = float(gain_map.get("TOF L", GAIN_LOW))
     scale = mid_gain / low_gain if low_gain else 1.0
-    low_scaled = low_baseline_sub * scale
+    low_scaled = low_arr * scale
 
-    if not mid_baseline_sub.size:
-        return mid_baseline_sub
+    if not mid_arr.size:
+        return mid_arr
 
-    peak = float(np.nanmax(mid_baseline_sub))
+    peak = float(np.nanmax(mid_arr))
     if not np.isfinite(peak):
-        return mid_baseline_sub
+        return mid_arr
 
     saturation_threshold = 0.90 * peak
-    saturation_mask = mid_baseline_sub >= saturation_threshold
+    saturation_mask = mid_arr >= saturation_threshold
 
-    combined = mid_baseline_sub.copy()
+    combined = mid_arr.copy()
     replace_mask = saturation_mask & np.isfinite(low_scaled)
     combined[replace_mask] = low_scaled[replace_mask]
 
@@ -1771,6 +1983,7 @@ class MassLineFit:
     time_end: float
     mass_guess: float
     abundance: float
+    baseline_offset: float = 0.0
     time_axis: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(0))
     fit_values: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(0))
     color: str = "#d62728"
@@ -1782,7 +1995,7 @@ class MassLineFit:
     def parameters(self) -> Tuple[float, float, float, float]:
         return (self.amplitude, self.mu, self.sigma, self.lam)
 
-    def evaluate(self, time_values: np.ndarray) -> np.ndarray:
+    def peak_only(self, time_values: np.ndarray) -> np.ndarray:
         return _evaluate_line_shape(
             self.shape,
             time_values,
@@ -1792,6 +2005,10 @@ class MassLineFit:
             self.lam,
             self.extra_params,
         )
+
+    def evaluate(self, time_values: np.ndarray) -> np.ndarray:
+        peak = self.peak_only(time_values)
+        return peak + float(self.baseline_offset)
 
     def as_row(self) -> Sequence[float | str]:
         return (
@@ -4035,18 +4252,9 @@ class DustCompositionWindow(QMainWindow):
         except Exception:
             self._baseline = 0.0
 
-        if BASELINE_ANCHORS_DATASET in group:
-            try:
-                anchors = np.asarray(group[BASELINE_ANCHORS_DATASET][()], dtype=float)
-                if anchors.ndim == 2 and anchors.shape[1] >= 2:
-                    self._baseline_points = [
-                        (float(mass), float(height))
-                        for mass, height in anchors[:, :2]
-                        if math.isfinite(mass) and math.isfinite(height)
-                    ]
-                    self._rebuild_baseline_spline()
-            except Exception:
-                self._baseline_points = []
+        # Ignore persisted spline anchors while the spline baseline workflow is disabled.
+        self._baseline_points = []
+        self._rebuild_baseline_spline()
 
         calibration_origin: Optional[float] = None
         try:
@@ -4118,7 +4326,10 @@ class DustCompositionWindow(QMainWindow):
                                 line.amplitude = inferred
                             else:
                                 area = float(
-                                    np.trapz(np.clip(line.fit_values, 0.0, None), line.time_axis)
+                                    np.trapz(
+                                        np.clip(line.fit_values - float(line.baseline_offset), 0.0, None),
+                                        line.time_axis,
+                                    )
                                 )
                                 if math.isfinite(area) and area > 0.0:
                                     line.amplitude = area
@@ -4228,6 +4439,10 @@ class DustCompositionWindow(QMainWindow):
                 mu = _coerce_float(_get_field(entry, ("mu", "time_mu", "center"), default=0.0))
                 sigma = _coerce_float(_get_field(entry, ("sigma", "width"), default=0.01))
                 lam = _coerce_float(_get_field(entry, ("lam", "lambda", "tau"), default=1.0), default=1.0)
+                baseline_offset = _coerce_float(
+                    _get_field(entry, ("baseline_offset", "baseline"), default=0.0),
+                    default=0.0,
+                )
                 time_start = _coerce_float(
                     _get_field(entry, ("time_start", "t_start"), default=mu - 3.0 * abs(sigma)),
                     default=mu - 3.0 * abs(sigma),
@@ -4298,6 +4513,7 @@ class DustCompositionWindow(QMainWindow):
                     time_end=time_end,
                     mass_guess=mass_guess,
                     abundance=abundance,
+                    baseline_offset=baseline_offset,
                     shape=shape_key,
                     extra_params=extra_params,
                 )
@@ -4654,26 +4870,9 @@ class DustCompositionWindow(QMainWindow):
         self.baseline_spin.valueChanged.connect(self._on_baseline_spin_changed)
         form.addRow("Baseline value:", self.baseline_spin)
         layout.addLayout(form)
-        self.baseline_spline_button = QPushButton("Spline Baseline", box)
-        self.baseline_spline_button.setCheckable(True)
-        self.baseline_spline_button.setToolTip(
-            "Drop as many control points as you like; a cubic spline will be used as the baseline."
-        )
-        self.baseline_spline_button.toggled.connect(self._toggle_spline_mode)
-        layout.addWidget(self.baseline_spline_button)
-        self.move_baseline_points_checkbox = QCheckBox("Move existing spline points", box)
-        self.move_baseline_points_checkbox.setToolTip(
-            "When enabled, clicks in spline mode reposition the nearest anchor instead of adding a new one."
-        )
-        self.move_baseline_points_checkbox.toggled.connect(self._on_move_spline_points_toggled)
-        layout.addWidget(self.move_baseline_points_checkbox)
-        self.clear_baseline_button = QPushButton("Clear Baseline Points", box)
-        self.clear_baseline_button.clicked.connect(self._clear_baseline_points)
-        layout.addWidget(self.clear_baseline_button)
-        self.baseline_points_label = QLabel("Spline anchors: 0", box)
-        self.baseline_points_label.setStyleSheet("color: #495057;")
-        layout.addWidget(self.baseline_points_label)
-        self._update_baseline_points_label()
+        # Spline baseline controls are intentionally disabled for now.
+        # The scalar baseline offset is more robust because it operates purely
+        # in the time domain and does not change when the mass calibration does.
         self.control_layout.addWidget(box)
 
     def _build_mass_axis_controls(self) -> None:
@@ -4730,6 +4929,13 @@ class DustCompositionWindow(QMainWindow):
         box = QGroupBox("Mass Line Tools", self.control_panel)
         layout = QVBoxLayout(box)
         layout.setSpacing(6)
+        self.auto_fit_button = QPushButton("Auto-Fit L2A Peaks", box)
+        self.auto_fit_button.setToolTip(
+            "Rebuild the mass spectrum using the L2A-style reference-mass calibration, "
+            "automatic peak detection, and per-peak EMG fits."
+        )
+        self.auto_fit_button.clicked.connect(self._auto_fit_l2a_mass_spectrum)
+        layout.addWidget(self.auto_fit_button)
         self.add_mass_button = QPushButton("Add Mass Line", box)
         self.add_mass_button.setToolTip("Select a region on the combined plot to fit an EMG mass line.")
         self.add_mass_button.setCheckable(True)
@@ -4883,27 +5089,15 @@ class DustCompositionWindow(QMainWindow):
         self._refresh_plot(show_combined=False)
 
     def _toggle_baseline_mode(self, checked: bool) -> None:
-        if checked and hasattr(self, "baseline_spline_button"):
-            self.baseline_spline_button.setChecked(False)
         self._in_baseline_mode = checked
         if checked:
             self.statusBar().showMessage("Baseline mode active — click on the plot to set the baseline.", 8000)
-        elif not self._in_spline_baseline_mode:
+        else:
             self.statusBar().clearMessage()
 
     def _toggle_spline_mode(self, checked: bool) -> None:
-        if checked and hasattr(self, "baseline_button"):
-            self.baseline_button.setChecked(False)
-        self._in_spline_baseline_mode = checked
-        if checked:
-            self._seed_spline_endpoints()
-            message = (
-                "Spline baseline mode — click along the spectrum to drop control points. "
-                "Enable ‘Move existing spline points’ to reposition anchors."
-            )
-            self.statusBar().showMessage(message, 8000)
-        elif not self._in_baseline_mode:
-            self.statusBar().clearMessage()
+        # Spline baselines are disabled pending a redesign.
+        self._in_spline_baseline_mode = False
 
     def _clear_baseline_points(self) -> None:
         self._baseline_points = []
@@ -5006,6 +5200,7 @@ class DustCompositionWindow(QMainWindow):
             time_end=float(data.get("time_end", 1.0)),
             mass_guess=float(data.get("mass", 0.0)),
             abundance=0.0,
+            baseline_offset=0.0,
             color="#2ca02c",
             shape="emg",
         )
@@ -5118,7 +5313,7 @@ class DustCompositionWindow(QMainWindow):
             line,
             time_axis=time_axis,
             signal=signal,
-            baseline=self._baseline,
+            baseline=line.baseline_offset,
             source_name=source,
             mass_converter=_mass_from_time,
         )
@@ -5140,7 +5335,7 @@ class DustCompositionWindow(QMainWindow):
             except Exception:
                 baseline_value = None
             if baseline_value is not None and math.isfinite(baseline_value):
-                self._set_baseline(baseline_value, from_user=True)
+                line.baseline_offset = baseline_value
 
         line.label = str(values.get("label", line.label))
         line.amplitude = float(values.get("amplitude", line.amplitude))
@@ -5204,7 +5399,7 @@ class DustCompositionWindow(QMainWindow):
             )
 
     def _on_canvas_click(self, event) -> None:
-        if not (self._in_baseline_mode or self._in_spline_baseline_mode):
+        if not self._in_baseline_mode:
             return
         if event is None or event.ydata is None:
             return
@@ -5214,18 +5409,7 @@ class DustCompositionWindow(QMainWindow):
                 valid_axes.add(self._combined_time_axis)
             if event.inaxes not in valid_axes:
                 return
-        if self._in_spline_baseline_mode:
-            mass_value = self._mass_from_event(event)
-            if mass_value is None:
-                return
-            if self._move_spline_points and self._baseline_points:
-                self._move_nearest_baseline_point(
-                    float(mass_value), float(event.ydata)
-                )
-            else:
-                self._append_baseline_point(float(mass_value), float(event.ydata))
-        else:
-            self._set_baseline(float(event.ydata), from_user=True)
+        self._set_baseline(float(event.ydata), from_user=True)
 
     def _mass_from_event(self, event) -> Optional[float]:
         if event is None or event.xdata is None:
@@ -5256,6 +5440,165 @@ class DustCompositionWindow(QMainWindow):
 
     def _auto_calculate_mass_axis(self) -> None:
         self._update_mass_axis_from_lines(show_warning=True)
+
+    def _auto_fit_l2a_mass_spectrum(self) -> None:
+        if self._time_axis.size == 0:
+            QMessageBox.information(self, "No Data", "No TOF time axis is available for automatic fitting.")
+            return
+
+        if self._combined is None:
+            self._combined = self._combine_waveforms()
+
+        fit_source_name = "TOF H"
+        fit_source = np.asarray(self._waveforms.get("TOF H", np.zeros(0)), dtype=float).ravel()
+        if fit_source.size == 0 and self._combined is not None:
+            fit_source = np.asarray(self._combined, dtype=float).ravel()
+            fit_source_name = "Combined TOF"
+        if fit_source.size == 0:
+            QMessageBox.information(self, "No Data", "No TOF waveform is available for automatic fitting.")
+            return
+
+        length = min(self._time_axis.size, fit_source.size)
+        if length < 8:
+            QMessageBox.information(self, "No Data", "The TOF waveform is too short to fit automatically.")
+            return
+
+        time_axis = np.asarray(self._time_axis[:length], dtype=float)
+        fit_signal = np.asarray(fit_source[:length], dtype=float)
+
+        try:
+            reference_masses = _load_l2a_reference_masses()
+            calibration, mass_scale, best_shift_us, best_stretch_us = _l2a_mass_calibration(
+                fit_signal,
+                time_axis,
+                reference_masses,
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Auto-Fit Failed",
+                f"Unable to derive the L2A-style mass calibration:\n{exc}",
+            )
+            return
+
+        peaks = find_peaks(fit_signal, prominence=L2A_PEAK_PROMINENCE)[0]
+        if peaks.size == 0:
+            QMessageBox.information(self, "No Peaks", "No TOF peaks were found for automatic fitting.")
+            return
+
+        previous = dict(self._mass_params)
+        self._apply_mass_calibration(calibration, origin=float(time_axis[0]))
+        self._mass_lines = []
+        self._mass_line_counter = 0
+        self._selected_line_id = None
+        self._rsf_enabled = False
+        self._rsf_values = {}
+        self._rsf_normalised = {}
+
+        successful_fits = 0
+        chisqrs: List[float] = []
+        redchis: List[float] = []
+
+        for peak in peaks:
+            fit_mask, window_start, window_end = _dynamic_time_window_for_peak(
+                time_axis,
+                fit_signal,
+                peaks,
+                int(peak),
+                max_half_window_us=EMG_FIT_HALF_WINDOW_US,
+            )
+            if np.count_nonzero(fit_mask) < 6:
+                continue
+
+            time_slice = time_axis[fit_mask]
+            signal_slice = fit_signal[fit_mask]
+            params, chisqr, redchi = _fit_l2a_emg_peak(time_slice, signal_slice)
+            if np.all(np.isnan(params)):
+                continue
+
+            baseline_fit, amplitude_fit, mu, sigma, lam = (
+                float(params[0]),
+                float(params[1]),
+                float(params[2]),
+                float(params[3]),
+                float(params[4]),
+            )
+            sigma = abs(sigma)
+            lam = abs(lam)
+            area = _l2a_area_under_emg(time_slice, params)
+
+            time_idx = int(np.argmin(np.abs(time_axis - mu)))
+            mass_guess = float(mass_scale[time_idx]) if mass_scale.size > time_idx else float("nan")
+            if not math.isfinite(mass_guess):
+                continue
+
+            if not math.isfinite(window_start) or not math.isfinite(window_end) or window_end <= window_start:
+                window_start = max(float(np.nanmin(time_axis)), float(mu) - EMG_FIT_HALF_WINDOW_US)
+                window_end = min(float(np.nanmax(time_axis)), float(mu) + EMG_FIT_HALF_WINDOW_US)
+            dense_time = np.linspace(window_start, window_end, 800)
+            line = MassLineFit(
+                line_id=self._mass_line_counter,
+                label=nearest_mass_name(mass_guess),
+                mu=mu,
+                sigma=sigma,
+                lam=lam,
+                amplitude=max(float(area), 1.0e-9),
+                time_start=window_start,
+                time_end=window_end,
+                mass_guess=float(mass_guess),
+                abundance=0.0,
+                baseline_offset=baseline_fit,
+                time_axis=dense_time,
+                color="#ff7f0e",
+                shape="emg",
+            )
+            line.fit_values = line.evaluate(dense_time)
+            self._mass_line_counter += 1
+            self._mass_lines.append(line)
+            successful_fits += 1
+            if math.isfinite(chisqr):
+                chisqrs.append(float(chisqr))
+            if math.isfinite(redchi):
+                redchis.append(float(redchi))
+
+        if successful_fits == 0:
+            self._mass_lines = []
+            self._mass_line_counter = 0
+            self._selected_line_id = None
+            self._apply_mass_params_update(previous)
+            QMessageBox.information(
+                self,
+                "No Fits",
+                "TOF peaks were found, but none of them could be fitted with the imported L2A EMG workflow.",
+            )
+            return
+
+        self._selected_line_id = self._mass_lines[0].line_id if self._mass_lines else None
+        if hasattr(self, "combine_button") and not self.combine_button.isChecked():
+            self.combine_button.setChecked(True)
+        self._apply_mass_params_update(previous)
+        self._update_mass_line_abundances()
+        self._update_tables()
+        self._update_summary()
+        self._refresh_plot()
+        self._update_mass_axis_lock()
+
+        kappa_values = np.asarray(
+            [abs(float(mass_scale[int(peak)]) - round(float(mass_scale[int(peak)]))) for peak in peaks if int(peak) < mass_scale.size],
+            dtype=float,
+        )
+        kappa_text = "n/a"
+        if kappa_values.size:
+            kappa_text = f"{float(np.nanmean(kappa_values)):.4f}"
+        mean_redchi = float(np.nanmean(redchis)) if redchis else float("nan")
+        source_text = fit_source_name
+        self.statusBar().showMessage(
+            "Auto-fit created "
+            f"{successful_fits} mass lines from {source_text} "
+            f"(stretch={best_stretch_us:.6f} us, shift={best_shift_us:.6f} us, "
+            f"kappa={kappa_text}, mean reduced chi^2={mean_redchi:.4g}).",
+            12000,
+        )
 
     def _on_mass_params_changed(self) -> None:
         self._mass_params["stretch"] = float(self.mass_stretch_spin.value())
@@ -5549,21 +5892,11 @@ class DustCompositionWindow(QMainWindow):
         mass_axis = self._combined_mass_axis()
         n = min(self._combined.size, mass_axis.size)
         ax.set_zorder(2)
-        baseline_curve = self._baseline_for_mass(mass_axis[:n])
-        corrected = self._combined[:n] - baseline_curve
-        ax.plot(mass_axis[:n], corrected, color="#1f77b4", linewidth=1.6, label="Combined TOF")
-        if not (self._in_baseline_mode or self._in_spline_baseline_mode):
-            print("a")
-            # ax.plot(
-            #     mass_axis[:n],
-            #     self._combined[:n],
-            #     color="#8da9d7",
-            #     linewidth=1.0,
-            #     alpha=0.6,
-            #     label="Raw TOF",
-            # )
+        waveform_plot = np.clip(np.asarray(self._combined[:n], dtype=float), PLOT_LOG_FLOOR, None)
+        ax.plot(mass_axis[:n], waveform_plot, color="#1f77b4", linewidth=1.6, label="Combined TOF")
         ax.set_facecolor("#f9fbff")
         ax.grid(True, alpha=0.35)
+        ax.set_yscale("log", nonpositive="clip")
         ax.set_xlabel("Mass [amu]", fontsize=14)
         ax.set_ylabel("Signal [pC/Δt]", fontsize=14)
         ax.set_title("Combined TOF Spectrum", fontsize=16, fontweight="bold")
@@ -5582,27 +5915,6 @@ class DustCompositionWindow(QMainWindow):
             ax_time.set_navigate(False)
             ax_time.patch.set_visible(False)
             self._combined_time_axis = ax_time
-        if len(self._baseline_points) or (self._baseline or self.baseline_spin.value() != 0.0):
-            # self._baseline_artist = ax.plot(
-            #     mass_axis[:n],
-            #     baseline_curve,
-            #     color="#aa3377",
-            #     linestyle="--",
-            #     linewidth=1.2,
-            #     label="Baseline",
-            # )[0]
-            if self._baseline_points:
-                anchors = np.asarray(self._baseline_points, dtype=float)
-                ax.scatter(
-                    anchors[:, 0],
-                    anchors[:, 1],
-                    color="#aa3377",
-                    edgecolor="#661733",
-                    s=40,
-                    alpha=0.9,
-                    zorder=6,
-                    label="Baseline anchors",
-                )
         selected_id = self._selected_line_id
         plotted_any = False
         for line in self._mass_lines:
@@ -5612,7 +5924,7 @@ class DustCompositionWindow(QMainWindow):
                 mass_axis = self._time_to_mass(line.time_axis)
             except Exception:
                 mass_axis = line.time_axis
-            y_values = line.fit_values
+            y_values = np.clip(np.asarray(line.fit_values, dtype=float), PLOT_LOG_FLOOR, None)
             try:
                 rgba = to_rgba(line.color)
                 base_color = line.color
@@ -5712,70 +6024,27 @@ class DustCompositionWindow(QMainWindow):
             self.baseline_points_label.setText(f"Spline anchors: {count}")
 
     def _rebuild_baseline_spline(self) -> None:
-        if len(self._baseline_points) < 2:
-            self._baseline_spline = None
-            return
-        try:
-            points = np.asarray(sorted(self._baseline_points, key=lambda p: p[0]), dtype=float)
-            mass_values, heights = points[:, 0], points[:, 1]
-            unique_mass, unique_indices = np.unique(mass_values, return_index=True)
-            if unique_mass.size < 2:
-                self._baseline_spline = None
-                return
-            unique_heights = heights[unique_indices]
-            self._baseline_spline = CubicSpline(unique_mass, unique_heights, extrapolate=True)
-        except Exception:
-            self._baseline_spline = None
+        # Spline baselines are disabled for now; keep a scalar baseline only.
+        self._baseline_spline = None
 
     def _baseline_for_mass(self, mass_values: np.ndarray) -> np.ndarray:
         mass = np.asarray(mass_values, dtype=float)
-        baseline = np.full_like(mass, self._baseline, dtype=float)
-        if self._baseline_spline is None:
-            if len(self._baseline_points) == 1:
-                anchor_level = self._baseline_points[0][1] + self._baseline
-                return np.full_like(mass, anchor_level, dtype=float)
-            return baseline
-        try:
-            spline_values = np.asarray(self._baseline_spline(mass), dtype=float)
-            baseline = baseline + spline_values
-        except Exception:
-            pass
-        return baseline
+        return np.zeros_like(mass, dtype=float)
 
     def _baseline_for_time(self, time_values: np.ndarray) -> np.ndarray:
-        try:
-            mass_values = self._time_to_mass(time_values)
-        except Exception:
-            mass_values = np.asarray(time_values, dtype=float)
-        return self._baseline_for_mass(mass_values)
+        times = np.asarray(time_values, dtype=float)
+        return np.zeros_like(times, dtype=float)
 
     def _append_baseline_point(self, mass_value: float, baseline_value: float) -> None:
-        if not math.isfinite(mass_value) or not math.isfinite(baseline_value):
-            return
-        updated = False
-        for idx, (mass, _) in enumerate(self._baseline_points):
-            if math.isclose(mass, mass_value, rel_tol=0.0, abs_tol=1.0e-9):
-                self._baseline_points[idx] = (mass_value, baseline_value)
-                updated = True
-                break
-        if not updated:
-            self._baseline_points.append((mass_value, baseline_value))
-        self._commit_baseline_points()
+        # Spline baselines are disabled for now.
+        return
 
     def _move_nearest_baseline_point(self, mass_value: float, baseline_value: float) -> None:
-        if not math.isfinite(mass_value) or not math.isfinite(baseline_value):
-            return
-        if not self._baseline_points:
-            return
-        nearest_idx = min(
-            range(len(self._baseline_points)),
-            key=lambda idx: abs(self._baseline_points[idx][0] - mass_value),
-        )
-        self._baseline_points[nearest_idx] = (mass_value, baseline_value)
-        self._commit_baseline_points()
+        # Spline baselines are disabled for now.
+        return
 
     def _commit_baseline_points(self) -> None:
-        self._baseline_points.sort(key=lambda p: p[0])
+        self._baseline_points = []
         self._rebuild_baseline_spline()
         self._update_baseline_points_label()
         self._update_mass_line_abundances()
@@ -5784,39 +6053,11 @@ class DustCompositionWindow(QMainWindow):
         self._refresh_plot()
 
     def _seed_spline_endpoints(self) -> None:
-        if self._combined is None:
-            self._combined = self._combine_waveforms()
-        if self._combined is None or self._combined.size == 0:
-            return
-        mass_axis = self._combined_mass_axis()
-        n = min(self._combined.size, mass_axis.size)
-        if n == 0:
-            return
-        window = min(50, n)
-        start_mean = float(np.nanmean(self._combined[:window]))
-        end_mean = float(np.nanmean(self._combined[n - window : n]))
-        endpoints: List[Tuple[float, float]] = []
-        if math.isfinite(start_mean):
-            endpoints.append((float(mass_axis[0]), start_mean))
-        if math.isfinite(end_mean):
-            endpoints.append((float(mass_axis[n - 1]), end_mean))
-        if not endpoints:
-            return
-        updated = False
-        for mass_value, baseline_value in endpoints:
-            for idx, (mass, _) in enumerate(self._baseline_points):
-                if math.isclose(mass, mass_value, rel_tol=0.0, abs_tol=1.0e-9):
-                    self._baseline_points[idx] = (mass_value, baseline_value)
-                    updated = True
-                    break
-            else:
-                self._baseline_points.append((mass_value, baseline_value))
-                updated = True
-        if updated:
-            self._commit_baseline_points()
+        # Spline baselines are disabled for now.
+        return
 
     def _on_move_spline_points_toggled(self, checked: bool) -> None:
-        self._move_spline_points = bool(checked)
+        self._move_spline_points = False
 
     def _set_baseline(self, value: float, from_user: bool = False) -> None:
         self._baseline = float(value)
@@ -5940,7 +6181,7 @@ class DustCompositionWindow(QMainWindow):
             return np.zeros(0, dtype=float), np.zeros(0, dtype=float), label
         length = min(time_axis.size, signal.size)
         trimmed_time = time_axis[:length]
-        trimmed_signal = signal[:length] - self._baseline_for_time(trimmed_time)
+        trimmed_signal = signal[:length]
         return trimmed_time, trimmed_signal, label
 
     def _update_inspect_button_state(self) -> None:
@@ -5988,42 +6229,46 @@ class DustCompositionWindow(QMainWindow):
             QMessageBox.warning(self, "Selection Too Small", "Select a region containing more samples.")
             return
         x = self._time_axis[mask]
-        y = self._combined[mask] - self._baseline_for_time(x)
+        y = self._combined[mask]
         if not np.any(np.isfinite(y)):
             QMessageBox.warning(self, "No Signal", "The selected region does not contain valid data.")
             return
+        candidate_peaks = find_peaks(y, prominence=L2A_PEAK_PROMINENCE)[0]
+        if candidate_peaks.size == 0:
+            QMessageBox.warning(self, "No Peaks", "No peak was found inside the selected region.")
+            return
         try:
-            mu_guess = float(x[np.nanargmax(y)])
+            local_peak = int(candidate_peaks[np.argmax(y[candidate_peaks])])
+            mu_guess = float(x[local_peak])
         except Exception:
             mu_guess = float(np.nanmean(x))
-        sigma_guess = max(float(np.nanstd(x)), 1.0e-6)
-        lam_guess = max(1.0 / max(sigma_guess, 1.0e-6), 1.0e-6)
-        amplitude_guess = float(np.trapz(np.clip(y, 0.0, None), x))
-        if not math.isfinite(amplitude_guess) or amplitude_guess <= 0.0:
-            amplitude_guess = max(float(np.nanmax(np.clip(y, 0.0, None))) * max(time_max - time_min, 1.0e-6), 1.0e-6)
-        try:
-            from scipy.optimize import curve_fit  # type: ignore
-        except Exception as exc:
-            QMessageBox.warning(self, "Missing SciPy", f"SciPy is required for EMG fitting:\n{exc}")
+            local_peak = int(np.nanargmax(y))
+        full_peak_index = int(np.where(mask)[0][local_peak])
+        selected_peak_indices = np.where(mask)[0][candidate_peaks]
+        fit_mask, window_start, window_end = _dynamic_time_window_for_peak(
+            self._time_axis,
+            self._combined,
+            selected_peak_indices,
+            full_peak_index,
+            max_half_window_us=EMG_FIT_HALF_WINDOW_US,
+        )
+        x_fit = self._time_axis[fit_mask]
+        y_fit = self._combined[fit_mask]
+        if x_fit.size < 6:
+            QMessageBox.warning(self, "Selection Too Small", "The dynamic fit window does not contain enough samples.")
             return
-
-        try:
-            params, _ = curve_fit(
-                lambda t, amplitude, mu, sigma, lam: _emg_model(t, amplitude, mu, abs(sigma), abs(lam)),
-                x,
-                y,
-                p0=(amplitude_guess, mu_guess, sigma_guess, lam_guess),
-                maxfev=20000,
-            )
-            amplitude_fit, mu_fit, sigma_fit, lam_fit = params
-            amplitude_fit = abs(float(amplitude_fit))
-            sigma_fit = abs(float(sigma_fit))
-            lam_fit = abs(float(lam_fit))
-        except Exception:
+        params, _, _ = _fit_l2a_emg_peak(x_fit, y_fit)
+        if np.any(~np.isfinite(params)):
             QMessageBox.warning(self, "Fit Failed", "Unable to fit an EMG curve to the selected region.")
             return
-        dense_time = np.linspace(time_min, time_max, 800)
-        fit_curve = _emg_model(dense_time, amplitude_fit, mu_fit, sigma_fit, lam_fit)
+        baseline_fit, amplitude_fit, mu_fit, sigma_fit, lam_fit = params
+        amplitude_fit = max(abs(float(amplitude_fit)), 1.0e-9)
+        sigma_fit = abs(float(sigma_fit))
+        lam_fit = abs(float(lam_fit))
+        if not math.isfinite(window_start) or not math.isfinite(window_end) or window_end <= window_start:
+            window_start = max(float(np.nanmin(self._time_axis)), float(mu_fit) - EMG_FIT_HALF_WINDOW_US)
+            window_end = min(float(np.nanmax(self._time_axis)), float(mu_fit) + EMG_FIT_HALF_WINDOW_US)
+        dense_time = np.linspace(window_start, window_end, 800)
         mass_guess = float(self._time_to_mass(mu_fit))
         label = nearest_mass_name(mass_guess)
         line = MassLineFit(
@@ -6033,10 +6278,11 @@ class DustCompositionWindow(QMainWindow):
             sigma=float(sigma_fit),
             lam=float(lam_fit),
             amplitude=float(amplitude_fit),
-            time_start=float(time_min),
-            time_end=float(time_max),
+            time_start=window_start,
+            time_end=window_end,
             mass_guess=mass_guess,
             abundance=0.0,
+            baseline_offset=float(baseline_fit),
             time_axis=dense_time,
             color="#ff7f0e",
             shape="emg",
@@ -6334,13 +6580,7 @@ class DustCompositionWindow(QMainWindow):
             if combined is not None:
                 _write_dataset(dust_group, COMBINED_DATASET, combined)
             dust_group.attrs["Baseline"] = self._baseline
-            if self._baseline_points:
-                try:
-                    anchor_array = np.asarray(self._baseline_points, dtype=float)
-                    _write_dataset(dust_group, BASELINE_ANCHORS_DATASET, anchor_array)
-                except Exception:
-                    pass
-            elif BASELINE_ANCHORS_DATASET in dust_group:
+            if BASELINE_ANCHORS_DATASET in dust_group:
                 try:
                     del dust_group[BASELINE_ANCHORS_DATASET]
                 except Exception:
@@ -6372,6 +6612,7 @@ class DustCompositionWindow(QMainWindow):
                     ("sigma", "f8"),
                     ("lam", "f8"),
                     ("amplitude", "f8"),
+                    ("baseline_offset", "f8"),
                     ("time_start", "f8"),
                     ("time_end", "f8"),
                     ("mass", "f8"),
@@ -6399,6 +6640,7 @@ class DustCompositionWindow(QMainWindow):
                         line.sigma,
                         line.lam,
                         line.total_area(),
+                        float(line.baseline_offset),
                         line.time_start,
                         line.time_end,
                         line.mass_guess,
