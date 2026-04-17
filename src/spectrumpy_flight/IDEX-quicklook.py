@@ -103,6 +103,7 @@ from spectrumpy_flight.calibration_data import AcceleratorMatch, AcceleratorMatc
 from spectrumpy_flight.mass_calibration import TOFMassCal
 from spectrumpy_flight.noise_analysis import ChannelMeta, launch_noise_analysis_window
 from spectrumpy_flight.plot_style import apply_plot_style
+from spectrumpy_flight.readTrc import Trc
 from spectrumpy_flight.tof_merge import combine_waveform_channels
 try:  # pragma: no cover - optional dependency, loaded lazily
     from spectrumpy_flight.HDF_View import launch_hdf_viewer
@@ -245,7 +246,7 @@ def prompt_for_data_file(
     *,
     preferred: Optional[str] = None,
 ) -> Optional[str]:
-    """Show a non-native file dialog that accepts HDF5 and CDF payloads."""
+    """Show a non-native file dialog that accepts HDF5, CDF, and TRC payloads."""
 
     if start_dir is None:
         repo_root = Path(__file__).resolve().parent
@@ -253,25 +254,36 @@ def prompt_for_data_file(
         preferred_map = {
             "cdf": repo_root / "CDF",
             "hdf5": hdf5_dir,
+            "trc": repo_root,
         }
         if preferred and (target_dir := preferred_map.get(preferred.lower())) and target_dir.exists():
             start_dir = str(target_dir)
         else:
             start_dir = str(repo_root)
 
+    if preferred == "trc":
+        directory = QFileDialog.getExistingDirectory(
+            parent,
+            "Open Trace Directory",
+            start_dir,
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog,
+        )
+        return directory or None
+
     options = QFileDialog.Option.DontUseNativeDialog | QFileDialog.Option.ReadOnly
 
     filters = [
-        "Data Files (*.h5 *.hdf5 *.cdf)",
+        "Data Files (*.h5 *.hdf5 *.cdf *.trc)",
         "HDF5 Files (*.h5 *.hdf5)",
         "CDF Files (*.cdf)",
+        "Trace Files (*.trc)",
         "All files (*)",
     ]
 
     if preferred == "hdf5":
-        filters = [filters[1], filters[0], filters[2], filters[3]]
+        filters = [filters[1], filters[0], filters[2], filters[3], filters[4]]
     elif preferred == "cdf":
-        filters = [filters[2], filters[0], filters[1], filters[3]]
+        filters = [filters[2], filters[0], filters[1], filters[3], filters[4]]
 
     filename, _ = QFileDialog.getOpenFileName(
         parent,
@@ -1589,6 +1601,7 @@ def _gather_mass_attributes(data_source: "BaseDataSource", event: str) -> Dict[s
 # --------- Channel & fit metadata ---------
 FAMILY_HIGH = "high"
 FAMILY_LOW = "low"
+FAMILY_GENERIC = "generic"
 
 
 @dataclass(frozen=True)
@@ -1624,11 +1637,13 @@ BASELINE_FALLBACK_THRESHOLD = -2.0
 FAMILY_YLABELS = {
     FAMILY_HIGH: r"$TOF$ [pC/ $\Delta t$]",
     FAMILY_LOW: r"$Q$ [pC]",
+    FAMILY_GENERIC: "Signal",
 }
 
 FAMILY_UNITS = {
     FAMILY_HIGH: "pC/Δt",
     FAMILY_LOW: "pC",
+    FAMILY_GENERIC: "V",
 }
 
 SUMMARY_EPOCH_REFERENCE = datetime(2010, 1, 1, tzinfo=timezone.utc)
@@ -2018,6 +2033,16 @@ class BaseDataSource(ABC):
     @abstractmethod
     def gather_fit_data(self, event: str, channel: str) -> FitData:
         """Collect fit products for ``channel`` within ``event``."""
+
+    def channel_definitions(self) -> Dict[str, ChannelDefinition]:
+        """Return the plottable channel definitions for this source."""
+
+        return dict(CHANNEL_DEFS)
+
+    def channel_order(self) -> List[str]:
+        """Return the preferred display order for the plottable channels."""
+
+        return list(CHANNEL_ORDER)
 
     def get_group_attributes(self, event: str, group_path: str) -> Dict[str, Any]:
         """Return attribute mapping for ``/{event}/{group_path}`` (default: empty)."""
@@ -2994,14 +3019,204 @@ class CDFDataSource(BaseDataSource):
         return launch_cdf_viewer(self.filename, parent=parent)
 
 
+class TRCDataSource(BaseDataSource):
+    """Adapter that exposes a directory of LeCroy ``.trc`` files as quicklook events."""
+
+    def __init__(self, filename: str):
+        super().__init__(filename)
+        source_path = Path(filename).expanduser()
+        if source_path.is_dir():
+            self._directory = source_path
+        else:
+            self._directory = source_path.parent
+
+        if not self._directory.exists():
+            raise FileNotFoundError(f"Trace directory not found: {self._directory}")
+
+        self._trace_files = sorted(
+            path for path in self._directory.iterdir() if path.is_file() and path.suffix.lower() == ".trc"
+        )
+        if not self._trace_files:
+            raise FileNotFoundError(f"No .trc files were found in {self._directory}")
+
+        self._event_files: Dict[str, List[Path]] = {}
+        self._channel_defs: Dict[str, ChannelDefinition] = {}
+        self._channel_order: List[str] = []
+        self._cached_event_name: Optional[str] = None
+        self._cached_event_payload: Dict[str, np.ndarray] = {}
+        self._cached_event_metadata: Dict[str, Any] = {}
+        self._index_traces()
+
+    @staticmethod
+    def _event_key_for_path(path: Path) -> Optional[str]:
+        match = re.search(r"-(\d+)\.trc$", path.name, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _channel_index_for_path(path: Path) -> Optional[int]:
+        match = re.match(r"C(\d+)\D", path.name, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _event_sort_key(key: str) -> Tuple[int, str]:
+        return (0, f"{int(key):08d}") if str(key).isdigit() else (1, str(key))
+
+    def _group_trace_files(self) -> List[Tuple[str, List[Path]]]:
+        grouped: Dict[str, List[Path]] = {}
+        for path in self._trace_files:
+            event_key = self._event_key_for_path(path)
+            if not event_key:
+                continue
+            grouped.setdefault(event_key, []).append(path)
+
+        return sorted(
+            (
+                (
+                    key,
+                    sorted(
+                        paths,
+                        key=lambda candidate: (
+                            self._channel_index_for_path(candidate) or 9999,
+                            candidate.name,
+                        ),
+                    ),
+                )
+                for key, paths in grouped.items()
+            ),
+            key=lambda item: self._event_sort_key(item[0]),
+        )
+
+    def _index_traces(self) -> None:
+        groups = self._group_trace_files()
+        channel_indices: Set[int] = set()
+
+        for event_name, paths in groups:
+            for path in paths:
+                channel_index = self._channel_index_for_path(path)
+                if channel_index is None:
+                    continue
+                channel_indices.add(channel_index)
+            if paths:
+                self._event_files[event_name] = list(paths)
+
+        if not self._event_files:
+            raise ValueError(f"Unable to parse .trc events from {self._directory}")
+
+        self._channel_order = [f"Channel {index}" for index in sorted(channel_indices)]
+        self._channel_defs = {
+            name: ChannelDefinition(
+                dataset=name,
+                time_dataset=f"Time {name}",
+                family=FAMILY_GENERIC,
+            )
+            for name in self._channel_order
+        }
+
+    def _load_event(self, event: str) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        event_name = str(event)
+        if event_name == self._cached_event_name:
+            return self._cached_event_payload, self._cached_event_metadata
+
+        paths = self._event_files.get(event_name, [])
+        payload: Dict[str, np.ndarray] = {}
+        metadata: Dict[str, Any] = {
+            "event_id": event_name,
+            "source_directory": str(self._directory),
+            "trace_count": len(paths),
+        }
+
+        trc_reader = Trc()
+        loaded_channels = 0
+        for path in paths:
+            channel_index = self._channel_index_for_path(path)
+            if channel_index is None:
+                continue
+            try:
+                time_values, amplitude_values, meta = trc_reader.open(str(path))
+            except Exception:
+                metadata[f"{path.name} Load Error"] = "Unable to load trace"
+                continue
+
+            channel_name = f"Channel {channel_index}"
+            time_name = f"Time {channel_name}"
+            payload[channel_name] = np.asarray(amplitude_values, dtype=float)
+            payload[time_name] = np.asarray(time_values, dtype=float)
+            metadata[f"{channel_name} File"] = path.name
+            metadata[f"{channel_name} Trace Label"] = meta.get("TRACE_LABEL", "")
+            metadata[f"{channel_name} Timebase"] = meta.get("TIMEBASE", "")
+            metadata[f"{channel_name} Vertical Unit"] = meta.get("VERTUNIT", "")
+            metadata[f"{channel_name} Horizontal Unit"] = meta.get("HORUNIT", "")
+            loaded_channels += 1
+
+        metadata["loaded_channel_count"] = loaded_channels
+        self._cached_event_name = event_name
+        self._cached_event_payload = payload
+        self._cached_event_metadata = metadata
+        return payload, metadata
+
+    def list_events(self) -> List[str]:
+        return list(self._event_files.keys())
+
+    def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
+        payload, _metadata = self._load_event(str(event))
+        if not payload:
+            return None
+        values = payload.get(dataset_name)
+        if values is None:
+            return None
+        return np.array(values, copy=True)
+
+    def gather_fit_data(self, event: str, channel: str) -> FitData:
+        return FitData()
+
+    def channel_definitions(self) -> Dict[str, ChannelDefinition]:
+        return dict(self._channel_defs)
+
+    def channel_order(self) -> List[str]:
+        return list(self._channel_order)
+
+    def get_global_attributes(self) -> Dict[str, Any]:
+        return {
+            "source_directory": str(self._directory),
+            "trace_file_count": len(self._trace_files),
+            "event_count": len(self._event_files),
+            "channel_count": len(self._channel_order),
+        }
+
+    def event_metadata_rows(self, event: str) -> List[Tuple[str, Any, str]]:
+        rows: List[Tuple[str, Any, str]] = []
+        payload, metadata = self._load_event(str(event))
+
+        for name in sorted(payload):
+            value = payload[name]
+            rows.append((name, _normalise_attr_value(value), _event_data_shape_text(value)))
+
+        for name in sorted(metadata):
+            rows.append((name, metadata[name], "Scalar"))
+        return rows
+
+    def describe(self) -> str:
+        return f"TRC Directory: {self._directory.name}"
+
+
 def create_data_source(filename: str) -> BaseDataSource:
     """Instantiate the appropriate data source for ``filename``."""
 
-    suffix = Path(filename).suffix.lower()
+    path = Path(filename)
+    if path.is_dir():
+        return TRCDataSource(filename)
+
+    suffix = path.suffix.lower()
     if suffix in {".h5", ".hdf5"}:
         return HDF5DataSource(filename)
     if suffix == ".cdf":
         return CDFDataSource(filename)
+    if suffix == ".trc":
+        return TRCDataSource(filename)
 
     # Fallback: attempt HDF5 first, then CDF.
     try:
@@ -4888,6 +5103,29 @@ class MainWindow(QMainWindow):
         if eventnumber is not None and self._events and 1 <= eventnumber <= len(self._events):
             self.event_combo.setCurrentIndex(eventnumber - 1)
 
+    def _channel_definitions(self) -> Dict[str, ChannelDefinition]:
+        if self._data_source is not None:
+            try:
+                definitions = self._data_source.channel_definitions()
+            except Exception:
+                definitions = {}
+            if definitions:
+                return definitions
+        return dict(CHANNEL_DEFS)
+
+    def _channel_order(self) -> List[str]:
+        if self._data_source is not None:
+            try:
+                order = self._data_source.channel_order()
+            except Exception:
+                order = []
+            if order:
+                return list(order)
+        return list(CHANNEL_ORDER)
+
+    def _channel_definition(self, channel: str) -> Optional[ChannelDefinition]:
+        return self._channel_definitions().get(channel)
+
     def _channel_scale(self, channel: str) -> float:
         """Return the waveform conversion factor for *channel*."""
 
@@ -4948,6 +5186,9 @@ class MainWindow(QMainWindow):
 
         self.open_cdf_action = QAction("Open CDF…", self)
         self.open_cdf_action.triggered.connect(lambda: self.action_open(preferred="cdf"))
+
+        self.open_trc_action = QAction("Open Trace Directory…", self)
+        self.open_trc_action.triggered.connect(lambda: self.action_open(preferred="trc"))
 
         self.view_structure_action = QAction("Open Data Browser", self)
         self.view_structure_action.setShortcut("Ctrl+B")
@@ -5038,6 +5279,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.open_any_action)
         file_menu.addAction(self.open_hdf5_action)
         file_menu.addAction(self.open_cdf_action)
+        file_menu.addAction(self.open_trc_action)
         file_menu.addSeparator()
 
         save_menu = QMenu("Export Plot", self)
@@ -5589,21 +5831,10 @@ class MainWindow(QMainWindow):
             action_widgets.append(button)
             control_buttons.append(button)
 
-        self._primary_channel_buttons: List[QPushButton] = []
-        channel_widgets: List[QWidget] = []
+        self._primary_channel_buttons = []
+        self._dynamic_channel_buttons: List[QPushButton] = []
+        self._channel_row_widgets_current: List[QWidget] = []
         fit_row_widgets: List[QWidget] = []
-        for name in CHANNEL_ORDER:
-            btn = QPushButton(name, self)
-            btn.setCheckable(True)
-            btn.setChecked(True)
-            btn.setMinimumHeight(0)
-            btn.setStyleSheet(toggle_style)
-            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            btn.clicked.connect(lambda checked, channel=name: self.on_channel_toggled(channel, checked))
-            self.channel_buttons[name] = btn
-            self._primary_channel_buttons.append(btn)
-            channel_widgets.append(btn)
-            control_buttons.append(btn)
 
         self.overlay_button = QPushButton("Combine Axes", self)
         self.overlay_button.setCheckable(True)
@@ -5612,7 +5843,6 @@ class MainWindow(QMainWindow):
         self.overlay_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.overlay_button.setToolTip("When enabled, channels with the same time base are drawn together.")
         self.overlay_button.clicked.connect(self.on_overlay_toggled)
-        channel_widgets.append(self.overlay_button)
         control_buttons.append(self.overlay_button)
 
         self.fit_buttons: Dict[str, QPushButton] = {}
@@ -5659,7 +5889,6 @@ class MainWindow(QMainWindow):
             "When enabled, all visible plots use the same time range."
         )
         self.same_time_scale_button.toggled.connect(self._on_same_time_scale_toggled)
-        channel_widgets.append(self.same_time_scale_button)
         control_buttons.append(self.same_time_scale_button)
 
         self.noise_button = QPushButton("Noise Analysis", self)
@@ -5699,18 +5928,19 @@ class MainWindow(QMainWindow):
         self.compact_plots_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.compact_plots_button.setToolTip("Toggle compact plot sizing and smaller plot labels.")
         self.compact_plots_button.toggled.connect(self._on_compact_plots_toggled)
-        channel_widgets.append(self.compact_plots_button)
         control_buttons.append(self.compact_plots_button)
 
-        self._control_grid_buttons = control_buttons
-        self._harmonize_primary_button_widths()
-        self._populate_control_button_grid(
-            button_grid,
-            action_widgets,
-            channel_widgets,
-            fit_row_widgets,
-            columns=10,
-        )
+        self._button_grid_layout = button_grid
+        self._button_grid_columns = 10
+        self._action_widgets = list(action_widgets)
+        self._channel_row_tail_widgets = [
+            self.overlay_button,
+            self.same_time_scale_button,
+            self.compact_plots_button,
+        ]
+        self._fit_row_widgets = list(fit_row_widgets)
+        self._static_control_buttons = list(control_buttons)
+        self._rebuild_channel_buttons()
         panel_layout.addWidget(button_grid_widget)
         self._update_viewer_action_states()
         self._set_edit_fit_controls_enabled(False)
@@ -5741,6 +5971,86 @@ class MainWindow(QMainWindow):
 
         for column, widget in enumerate(fit_row_widgets):
             layout.addWidget(widget, base_row + 1, column, alignment=Qt.AlignmentFlag.AlignLeft)
+
+    def _rebuild_channel_buttons(self) -> None:
+        order = self._channel_order()
+        previous_selection = set(getattr(self, "selected_channels", set()))
+        preserved_selection = previous_selection & set(order)
+        default_to_all = not preserved_selection
+
+        for button in getattr(self, "_dynamic_channel_buttons", []):
+            if self._button_grid_layout is not None:
+                self._button_grid_layout.removeWidget(button)
+            button.deleteLater()
+
+        self.channel_buttons = {}
+        self._primary_channel_buttons = []
+        self._dynamic_channel_buttons = []
+
+        toggle_style = (
+            """
+            QPushButton {
+                font-size: 14px;
+                font-weight: 600;
+                padding: 4px 10px;
+                border-radius: 10px;
+                background-color: #f3f6fd;
+                border: 1px solid #d3ddef;
+                color: #1f2937;
+            }
+            QPushButton:hover {
+                background-color: #e8eefc;
+            }
+            QPushButton:checked {
+                background-color: #4c6ef5;
+                border: 1px solid #364fc7;
+                color: #ffffff;
+            }
+            QPushButton:disabled {
+                background-color: #e5e7eb;
+                border: 1px solid #d1d5db;
+                color: #9ca3af;
+            }
+            """
+        )
+
+        for name in order:
+            btn = QPushButton(name, self)
+            btn.setCheckable(True)
+            btn.setChecked(True if default_to_all else name in preserved_selection)
+            btn.setMinimumHeight(0)
+            btn.setStyleSheet(toggle_style)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            btn.clicked.connect(lambda checked, channel=name: self.on_channel_toggled(channel, checked))
+            self.channel_buttons[name] = btn
+            self._primary_channel_buttons.append(btn)
+            self._dynamic_channel_buttons.append(btn)
+
+        self.selected_channels = {name for name in order if self.channel_buttons[name].isChecked()}
+        self._relayout_control_rows()
+        self._control_grid_buttons = (
+            list(self._static_control_buttons)
+            + list(self._dynamic_channel_buttons)
+        )
+        self._harmonize_primary_button_widths()
+
+    def _relayout_control_rows(self) -> None:
+        layout = getattr(self, "_button_grid_layout", None)
+        if layout is None:
+            return
+
+        for widget in list(getattr(self, "_channel_row_widgets_current", [])) + list(getattr(self, "_fit_row_widgets", [])):
+            layout.removeWidget(widget)
+
+        channel_widgets = list(self._dynamic_channel_buttons) + list(self._channel_row_tail_widgets)
+        self._channel_row_widgets_current = channel_widgets
+        self._populate_control_button_grid(
+            layout,
+            self._action_widgets,
+            channel_widgets,
+            self._fit_row_widgets,
+            columns=self._button_grid_columns,
+        )
 
     def _harmonize_primary_button_widths(self) -> None:
         """Apply one compact fixed size across the main quicklook control buttons."""
@@ -5790,13 +6100,20 @@ class MainWindow(QMainWindow):
         self.event_combo.blockSignals(False)
 
     def _update_interesting_event_button_states(self) -> None:
-        has_data = bool(self._data_source and self._all_events)
+        supported_channels = {"TOF L", "TOF M", "TOF H"}
+        has_tof_channels = bool(supported_channels & set(self._channel_order()))
+        has_data = bool(self._data_source and self._all_events and has_tof_channels)
         has_matches = bool(self._interesting_event_matches)
 
         if hasattr(self, "interesting_events_button"):
             self.interesting_events_button.setEnabled(has_data)
             if not has_data:
-                self.interesting_events_button.setToolTip("Open a data file to scan for interesting events.")
+                if self._data_source and not has_tof_channels:
+                    self.interesting_events_button.setToolTip(
+                        "Interesting-event scanning is only available for TOF-based event products."
+                    )
+                else:
+                    self.interesting_events_button.setToolTip("Open a data file to scan for interesting events.")
             elif self._interesting_event_filter_active:
                 self.interesting_events_button.setToolTip(
                     f"Interesting-event filter active ({len(self._interesting_event_matches)} matches)."
@@ -6863,7 +7180,7 @@ class MainWindow(QMainWindow):
             return
 
         available = False
-        for channel in CHANNEL_ORDER:
+        for channel in self._channel_order():
             values, _times = self._resolve_channel_data(self._current_event, channel)
             if values is None:
                 continue
@@ -6887,7 +7204,7 @@ class MainWindow(QMainWindow):
                 time_dataset=definition.time_dataset,
                 unit=FAMILY_UNITS.get(definition.family, ""),
             )
-            for name, definition in CHANNEL_DEFS.items()
+            for name, definition in self._channel_definitions().items()
         ]
 
         def loader(event: str, channel: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -7054,18 +7371,23 @@ class MainWindow(QMainWindow):
             )
             return
 
-        columns = [
-            ("Time (high sampling)", "Time (high sampling)"),
-            ("TOF L", "TOF L"),
-            ("TOF M", "TOF M"),
-            ("TOF H", "TOF H"),
-            ("TOF Combined", "Analysis/DustComposition/CombinedSignal"),
-            ("Mass", "Mass"),
-            ("Time (low sampling)", "Time (low sampling)"),
-            ("Ion Grid", "Ion Grid"),
-            ("Target L", "Target L"),
-            ("Target H", "Target H"),
-        ]
+        columns: List[Tuple[str, str]] = []
+        seen_columns: Set[str] = set()
+        for channel_name in self._channel_order():
+            definition = self._channel_definition(channel_name)
+            if definition is None:
+                continue
+            if definition.time_dataset not in seen_columns:
+                columns.append((definition.time_dataset, definition.time_dataset))
+                seen_columns.add(definition.time_dataset)
+            if definition.dataset not in seen_columns:
+                columns.append((channel_name, definition.dataset))
+                seen_columns.add(definition.dataset)
+
+        for extra_name in ("Mass",):
+            if extra_name not in seen_columns:
+                columns.append((extra_name, extra_name))
+                seen_columns.add(extra_name)
 
         data: Dict[str, pd.Series] = {}
         missing: List[str] = []
@@ -7132,6 +7454,7 @@ class MainWindow(QMainWindow):
         self.event_combo.blockSignals(True)
         self.event_combo.clear()
         self.event_combo.blockSignals(False)
+        self._rebuild_channel_buttons()
         self._update_viewer_action_states()
         self._update_interesting_event_button_states()
         self._set_edit_fit_controls_enabled(False)
@@ -7159,7 +7482,7 @@ class MainWindow(QMainWindow):
         if not self.channel_buttons:
             return
 
-        for name, definition in CHANNEL_DEFS.items():
+        for name, definition in self._channel_definitions().items():
             btn = self.channel_buttons.get(name)
             if btn is None:
                 continue
@@ -7294,7 +7617,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _resolve_channel_data(self, event: str, channel: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        definition = CHANNEL_DEFS.get(channel)
+        definition = self._channel_definition(channel)
         if not definition:
             return None, None
         values = self._get_dataset(event, definition.dataset)
@@ -7370,6 +7693,7 @@ class MainWindow(QMainWindow):
         self._h5 = h5_handle
         self._data_source = source
         self._filename = path
+        self._rebuild_channel_buttons()
         self._update_viewer_action_states()
 
         events = source.list_events()
@@ -7472,7 +7796,9 @@ class MainWindow(QMainWindow):
         self._update_channel_button_states(event_name)
         self.refresh_fit_controls()
 
-        selected = [name for name in CHANNEL_ORDER if self.channel_buttons.get(name) and self.channel_buttons[name].isChecked()]
+        channel_order = self._channel_order()
+        channel_defs = self._channel_definitions()
+        selected = [name for name in channel_order if self.channel_buttons.get(name) and self.channel_buttons[name].isChecked()]
         missing: List[str] = []
 
         aid = _get_event_aid(self._data_source, event_name)
@@ -7511,12 +7837,15 @@ class MainWindow(QMainWindow):
         try:
             if overlay_mode:
                 families: List[Tuple[str, List[str]]] = []
-                high = [ch for ch in selected if CHANNEL_DEFS[ch].family == FAMILY_HIGH]
-                low = [ch for ch in selected if CHANNEL_DEFS[ch].family == FAMILY_LOW]
+                high = [ch for ch in selected if channel_defs.get(ch) and channel_defs[ch].family == FAMILY_HIGH]
+                low = [ch for ch in selected if channel_defs.get(ch) and channel_defs[ch].family == FAMILY_LOW]
+                generic = [ch for ch in selected if channel_defs.get(ch) and channel_defs[ch].family == FAMILY_GENERIC]
                 if high:
                     families.append((FAMILY_HIGH, high))
                 if low:
                     families.append((FAMILY_LOW, low))
+                if generic:
+                    families.append((FAMILY_GENERIC, generic))
 
                 if not families:
                     ax = self.figure.add_subplot(111)
@@ -7548,7 +7877,7 @@ class MainWindow(QMainWindow):
                             plotted_any |= self._plot_channel(ax, event_name, channel, overlay_mode=True, missing_channels=missing)
                         self._style_overlay_axis(ax, family, bottom=(idx == len(families)))
             else:
-                ordered = [ch for ch in CHANNEL_ORDER if ch in selected]
+                ordered = [ch for ch in channel_order if ch in selected]
                 if not ordered:
                     ax = self.figure.add_subplot(111)
                     self._current_axis_count = 1
@@ -7566,7 +7895,7 @@ class MainWindow(QMainWindow):
                     grid = self.figure.add_gridspec(len(ordered), 1, hspace=0.00)
                     shared_axes: Dict[str, Any] = {}
                     for idx, channel in enumerate(ordered):
-                        family = CHANNEL_DEFS[channel].family
+                        family = channel_defs[channel].family
                         share_key = "__all__" if same_time_scale else family
                         ax = self.figure.add_subplot(grid[idx, 0], sharex=shared_axes.get(share_key))
                         if share_key not in shared_axes:
@@ -7575,7 +7904,7 @@ class MainWindow(QMainWindow):
                         plotted_any = self._plot_channel(ax, event_name, channel, overlay_mode=False, missing_channels=missing)
                         next_family = None
                         if idx + 1 < len(ordered):
-                            next_family = CHANNEL_DEFS[ordered[idx + 1]].family
+                            next_family = channel_defs[ordered[idx + 1]].family
                         self._style_single_axis(
                             ax,
                             channel=channel,
@@ -7697,7 +8026,12 @@ class MainWindow(QMainWindow):
         ax._time_axis = twin
 
     def _plot_channel(self, ax, event_name: str, channel: str, overlay_mode: bool, missing_channels: List[str]) -> bool:
-        definition = CHANNEL_DEFS[channel]
+        definition = self._channel_definition(channel)
+        if definition is None:
+            if not overlay_mode:
+                self._draw_missing_message(ax, channel, "Unsupported channel")
+            missing_channels.append(channel)
+            return False
         time_data = self._get_dataset(event_name, definition.time_dataset)
         value_data = self._get_dataset(event_name, definition.dataset)
 
@@ -7798,7 +8132,7 @@ class MainWindow(QMainWindow):
             self._baseline_cache[key] = baseline_value
             return baseline_value
 
-        definition = CHANNEL_DEFS.get(channel)
+        definition = self._channel_definition(channel)
         if not definition:
             self._baseline_cache[key] = baseline_value
             return baseline_value
@@ -7873,7 +8207,7 @@ class MainWindow(QMainWindow):
         if yielded or not data.parameter_series or not self._data_source:
             return
 
-        definition = CHANNEL_DEFS.get(channel)
+        definition = self._channel_definition(channel)
         if not definition:
             return
         base_time_data = self._get_dataset(event_name, definition.time_dataset)
@@ -7974,7 +8308,7 @@ class MainWindow(QMainWindow):
         ax.set_facecolor("#f8f9fb")
         ax.grid(True, alpha=0.35)
         ax.tick_params(axis="both", labelsize=font_sizes["tick"], width=1.5, length=7)
-        current_family = CHANNEL_DEFS.get(channel)
+        current_family = self._channel_definition(channel)
         family_name = current_family.family if current_family else None
         if self._same_time_scale_enabled():
             show_x = bottom
@@ -8031,7 +8365,7 @@ class MainWindow(QMainWindow):
         event_label = self._current_event or "–"
         parts.append(f"Event {event_label}")
 
-        channels = [ch for ch in CHANNEL_ORDER if ch in self.selected_channels and self.channel_buttons.get(ch) and self.channel_buttons[ch].isChecked()]
+        channels = [ch for ch in self._channel_order() if ch in self.selected_channels and self.channel_buttons.get(ch) and self.channel_buttons[ch].isChecked()]
         parts.append("Channels: " + (", ".join(channels) if channels else "none"))
         parts.append(f"Overlay: {'ON' if self.overlay_button.isChecked() else 'OFF'}")
 
@@ -8276,7 +8610,7 @@ class MainWindow(QMainWindow):
         result_path, time_path = derived
         time_data = self._get_dataset_by_path(time_path)
         if time_data is None:
-            definition = CHANNEL_DEFS.get(channel)
+            definition = self._channel_definition(channel)
             if definition:
                 time_data = self._get_dataset(event, definition.time_dataset)
         if time_data is None:
