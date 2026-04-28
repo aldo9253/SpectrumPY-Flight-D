@@ -131,7 +131,7 @@ from matplotlib import patheffects
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import FuncFormatter, LogFormatterSciNotation, LogLocator, NullFormatter, NullLocator
 from matplotlib.widgets import SpanSelector
 
 
@@ -1633,6 +1633,9 @@ RISE_METRIC_CHANNELS = {"Ion Grid", "Target L", "Target H"}
 
 BASELINE_PRIMARY_WINDOW = (-7.0, -5.0)
 BASELINE_FALLBACK_THRESHOLD = -2.0
+INTERESTING_EVENT_MIN_PEAK_COUNT = 2
+INTERESTING_EVENT_MIN_PEAK_WIDTH_US = 0.10
+INTERESTING_EVENT_MIN_SINGLE_PEAK_DURATION_US = 0.75
 
 FAMILY_YLABELS = {
     FAMILY_HIGH: r"$TOF$ [pC/ $\Delta t$]",
@@ -5905,7 +5908,7 @@ class MainWindow(QMainWindow):
         self.interesting_events_button.setStyleSheet(action_style)
         self.interesting_events_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.interesting_events_button.setToolTip(
-            "Filter to events with multiple threshold-crossing TOF peaks or a TOF crossing lasting at least 0.5 us."
+            "Filter to events with at least two TOF peaks wider than 0.10 us or a single TOF threshold crossing lasting at least 0.75 us."
         )
         self.interesting_events_button.clicked.connect(self.apply_interesting_event_filter)
         fit_row_widgets.append(self.interesting_events_button)
@@ -6120,11 +6123,11 @@ class MainWindow(QMainWindow):
                 )
             elif has_matches:
                 self.interesting_events_button.setToolTip(
-                    f"Filter to {len(self._interesting_event_matches)} TOF events with multiple peaks or >= 0.5 us threshold crossings."
+                    f"Filter to {len(self._interesting_event_matches)} TOF events with at least two peaks wider than 0.10 us or a single crossing >= 0.75 us."
                 )
             else:
                 self.interesting_events_button.setToolTip(
-                    "Filter to events with multiple threshold-crossing TOF peaks or a TOF crossing lasting at least 0.5 us."
+                    "Filter to events with at least two TOF peaks wider than 0.10 us or a single TOF threshold crossing lasting at least 0.75 us."
                 )
 
         if hasattr(self, "reset_event_filter_button"):
@@ -6177,7 +6180,7 @@ class MainWindow(QMainWindow):
         if starts.size == 0 or ends.size == 0:
             return 0, 0.0
 
-        peak_count = int(min(starts.size, ends.size))
+        peak_count = 0
         longest_duration = 0.0
         for start, end in zip(starts, ends):
             if end <= start:
@@ -6185,8 +6188,12 @@ class MainWindow(QMainWindow):
             stop_index = min(end - 1, time_array.size - 1)
             start_index = min(start, time_array.size - 1)
             duration = float(time_array[stop_index] - time_array[start_index])
-            if np.isfinite(duration):
-                longest_duration = max(longest_duration, max(duration, 0.0))
+            if not np.isfinite(duration):
+                continue
+            duration = max(duration, 0.0)
+            longest_duration = max(longest_duration, duration)
+            if duration >= INTERESTING_EVENT_MIN_PEAK_WIDTH_US:
+                peak_count += 1
 
         return peak_count, longest_duration
 
@@ -6196,7 +6203,10 @@ class MainWindow(QMainWindow):
             if metrics is None:
                 continue
             peak_count, longest_duration = metrics
-            if peak_count >= 2 or longest_duration >= 0.5:
+            if (
+                peak_count >= INTERESTING_EVENT_MIN_PEAK_COUNT
+                or longest_duration >= INTERESTING_EVENT_MIN_SINGLE_PEAK_DURATION_US
+            ):
                 return True
         return False
 
@@ -6208,7 +6218,7 @@ class MainWindow(QMainWindow):
         for index, event in enumerate(self._all_events, start=1):
             if progress is not None:
                 progress.setLabelText(
-                    f"Scanning event {index} of {total} for multiple TOF peaks and extended threshold crossings..."
+                    f"Scanning event {index} of {total} for wide TOF peaks and extended threshold crossings..."
                 )
                 progress.setValue(index - 1)
                 QApplication.processEvents()
@@ -6232,9 +6242,9 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.statusBar().showMessage("Scanning events for multiple TOF peaks and >= 0.5 us threshold crossings...")
+        self.statusBar().showMessage("Scanning events for wide TOF peaks and >= 0.75 us threshold crossings...")
         progress = QProgressDialog(
-            "Scanning events for multiple TOF peaks and extended threshold crossings...",
+            "Scanning events for wide TOF peaks and extended threshold crossings...",
             "Cancel",
             0,
             len(self._all_events),
@@ -8307,6 +8317,16 @@ class MainWindow(QMainWindow):
         font_sizes = self._plot_font_sizes()
         ax.set_facecolor("#f8f9fb")
         ax.grid(True, alpha=0.35)
+        if channel == "TOF Combined":
+            ax.set_yscale("log")
+            # Keep compact plots readable when the autoscaled log range spans less
+            # than a full decade by limiting labels to a small major-tick set.
+            ax.yaxis.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 5.0), numticks=2))
+            ax.yaxis.set_major_formatter(LogFormatterSciNotation(base=10.0, labelOnlyBase=False))
+            ax.yaxis.set_minor_locator(NullLocator())
+            ax.yaxis.set_minor_formatter(NullFormatter())
+        else:
+            ax.set_yscale("linear")
         ax.tick_params(axis="both", labelsize=font_sizes["tick"], width=1.5, length=7)
         current_family = self._channel_definition(channel)
         family_name = current_family.family if current_family else None
