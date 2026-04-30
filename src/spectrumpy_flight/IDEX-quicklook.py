@@ -1524,11 +1524,12 @@ def _get_event_aid(data_source: "BaseDataSource | None", event: Optional[str]) -
     return None
 
 
-def _format_event_title(filename: str, event: str, aid: Any) -> str:
-    title = f"{os.path.basename(filename)} — Event {event}"
-    if aid is None:
-        return f"{title} — AID Unknown"
-    return f"{title} — AID {aid}"
+def _format_event_title(filename: str, event: str, timestamp_ms: Optional[float]) -> str:
+    title = os.path.basename(filename)
+    event_time = _timestamp_to_iso(timestamp_ms)
+    if event_time != "Unavailable":
+        return f"{title} — {event_time}"
+    return f"{title} — Event {event}"
 
 
 def _coerce_float_attr(value: Any) -> Optional[float]:
@@ -1670,6 +1671,16 @@ CHANNEL_CONVERSION_FACTORS: Dict[str, float] = {
     "Ion Grid": 7.46e-4,
     "Target H": 1.63e-1,
     "Target L": 1.58e1,
+}
+
+CHANNEL_PLOT_COLORS: Dict[str, str] = {
+    "TOF L": "#1d4ed8",
+    "TOF M": "#0f766e",
+    "TOF H": "#b91c1c",
+    "TOF Combined": "#6d28d9",
+    "Ion Grid": "#c2410c",
+    "Target L": "#15803d",
+    "Target H": "#7c3aed",
 }
 
 
@@ -1831,6 +1842,27 @@ def _masked_mean(values: np.ndarray, mask: np.ndarray) -> Optional[float]:
     if subset.size == 0:
         return None
     return float(subset.mean())
+
+
+def _robust_baseline_value(values: np.ndarray) -> Optional[float]:
+    samples = np.asarray(values, dtype=float).reshape(-1)
+    samples = samples[np.isfinite(samples)]
+    if samples.size == 0:
+        return None
+    if samples.size == 1:
+        return float(samples[0])
+
+    median = float(np.median(samples))
+    deviations = np.abs(samples - median)
+    mad = float(np.median(deviations))
+    if not np.isfinite(mad) or mad <= 1.0e-12:
+        return median
+
+    robust_sigma = 1.4826 * mad
+    clipped = samples[deviations <= (3.5 * robust_sigma)]
+    if clipped.size == 0:
+        clipped = samples
+    return float(np.median(clipped))
 
 
 def _fit_paths_from_param(dataset_path: str) -> Optional[Tuple[str, str]]:
@@ -4986,7 +5018,7 @@ class MainWindow(QMainWindow):
         self._stats_axes: List[Any] = []
         self._show_fit: Dict[str, bool] = {name: False for name in FIT_ELIGIBLE_CHANNELS}
         self._compact_plot_mode = True
-        self._same_time_scale_mode = False
+        self._same_time_scale_mode = True
         self._current_axis_count = 1
         self._plot_window_handle = None
         # ``refresh_fit_controls`` is invoked as soon as data are loaded, so make
@@ -6386,7 +6418,7 @@ class MainWindow(QMainWindow):
         self._update_canvas_geometry(getattr(self, "_current_axis_count", 1))
         if self._compact_plots_enabled():
             try:
-                self.canvas.draw()
+                self._draw_canvas_safely()
             except Exception:
                 pass
             self._update_compact_y_label_layout()
@@ -6439,6 +6471,7 @@ class MainWindow(QMainWindow):
                 "title": 16,
                 "label": 11,
                 "tick": 10,
+                "legend": 10,
                 "twin_label": 10,
                 "twin_tick": 9,
                 "message": 13,
@@ -6447,10 +6480,20 @@ class MainWindow(QMainWindow):
             "title": 20,
             "label": 16,
             "tick": 14,
+            "legend": 13,
             "twin_label": 14,
             "twin_tick": 12,
             "message": 16,
         }
+
+    def _draw_canvas_safely(self) -> None:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"constrained_layout not applied because axes sizes collapsed to zero.*",
+                category=UserWarning,
+            )
+            self.canvas.draw()
 
     def _update_compact_y_label_layout(self) -> None:
         """Adjust compact y-labels so stacked plots remain readable on small screens."""
@@ -7811,9 +7854,9 @@ class MainWindow(QMainWindow):
         selected = [name for name in channel_order if self.channel_buttons.get(name) and self.channel_buttons[name].isChecked()]
         missing: List[str] = []
 
-        aid = _get_event_aid(self._data_source, event_name)
+        timestamp_ms = _guess_event_timestamp_ms(self._data_source, event_name)
         self.figure.suptitle(
-            _format_event_title(self._filename or "", event_name, aid),
+            _format_event_title(self._filename or "", event_name, timestamp_ms),
             fontsize=self._plot_font_sizes()["title"],
             fontweight="bold",
         )
@@ -7939,7 +7982,7 @@ class MainWindow(QMainWindow):
         self._stats_axes = axes
         self._set_stats_selector_active(self._stats_selector_active)
         try:
-            self.canvas.draw()
+            self._draw_canvas_safely()
         except Exception:
             pass
         self._update_compact_y_label_layout()
@@ -8044,6 +8087,10 @@ class MainWindow(QMainWindow):
             return False
         time_data = self._get_dataset(event_name, definition.time_dataset)
         value_data = self._get_dataset(event_name, definition.dataset)
+        zero_baseline = bool(overlay_mode)
+        baseline_offset = self._estimate_baseline(event_name, channel, time_data) if zero_baseline else 0.0
+        waveform_color = CHANNEL_PLOT_COLORS.get(channel, "#111111")
+        waveform_label = channel if overlay_mode else channel
 
         base_plotted = False
         reason: Optional[str] = None
@@ -8063,14 +8110,16 @@ class MainWindow(QMainWindow):
                 n = min(len(filtered_time), len(filtered_values))
                 if n:
                     times = np.asarray(filtered_time[:n], dtype=float)
-                    values = self._apply_plot_scale(channel, filtered_values[:n])
+                    values = np.asarray(self._apply_plot_scale(channel, filtered_values[:n]), dtype=float)
+                    if zero_baseline:
+                        values = values - baseline_offset
                     ax.plot(
                         times,
                         values,
-                        color="#111111",
+                        color=waveform_color if overlay_mode else "#111111",
                         linewidth=1.1,
                         alpha=0.85,
-                        label=channel,
+                        label=waveform_label,
                         zorder=2,
                     )[0].set_gid("waveform")
                     base_plotted = True
@@ -8088,21 +8137,31 @@ class MainWindow(QMainWindow):
                 else:
                     times = np.asarray(t[:n], dtype=float)
                     values = np.asarray(self._apply_plot_scale(channel, y[:n]), dtype=float)
+                    if zero_baseline:
+                        values = values - baseline_offset
                     ax.plot(
                         times,
                         values,
-                        color="#111111",
+                        color=waveform_color if overlay_mode else "#111111",
                         linewidth=1.1,
                         alpha=0.85,
-                        label=channel,
+                        label=waveform_label,
                         zorder=2,
                     )[0].set_gid("waveform")
                     base_plotted = True
 
-        fit_plotted = self._plot_fit(ax, event_name, channel, overlay_mode)
+        fit_plotted = self._plot_fit(
+            ax,
+            event_name,
+            channel,
+            overlay_mode,
+            zero_baseline=zero_baseline,
+            baseline_offset=baseline_offset,
+            line_color=waveform_color,
+        )
 
         if base_plotted or fit_plotted:
-            self._plot_trigger_level(ax, event_name, channel)
+            self._plot_trigger_level(ax, event_name, channel, baseline_offset=baseline_offset if zero_baseline else 0.0)
             if not overlay_mode:
                 ax.set_ylabel(y_label_with_units(channel), fontsize=self._plot_font_sizes()["label"])
             return True
@@ -8113,7 +8172,7 @@ class MainWindow(QMainWindow):
             missing_channels.append(channel)
         return False
 
-    def _plot_trigger_level(self, ax, event_name: str, channel: str) -> None:
+    def _plot_trigger_level(self, ax, event_name: str, channel: str, baseline_offset: float = 0.0) -> None:
         if not self._data_source:
             return
         trigger_channels = _guess_active_trigger_channels(self._data_source, event_name)
@@ -8122,8 +8181,9 @@ class MainWindow(QMainWindow):
         trigger_level = _guess_trigger_level_for_channel(self._data_source, event_name, channel)
         if trigger_level is None or not np.isfinite(trigger_level):
             return
+        adjusted_level = float(trigger_level) - float(baseline_offset)
         ax.axhline(
-            trigger_level,
+            adjusted_level,
             color="#0ca678",
             linestyle="--",
             linewidth=1.4,
@@ -8175,25 +8235,30 @@ class MainWindow(QMainWindow):
         candidate: Optional[float] = None
         if times is not None and times.size == raw_values.size:
             primary_mask = (times >= BASELINE_PRIMARY_WINDOW[0]) & (times <= BASELINE_PRIMARY_WINDOW[1])
-            candidate = _masked_mean(raw_values, primary_mask)
+            candidate = _robust_baseline_value(raw_values[primary_mask])
             if candidate is None:
                 fallback_mask = times < BASELINE_FALLBACK_THRESHOLD
-                candidate = _masked_mean(raw_values, fallback_mask)
+                candidate = _robust_baseline_value(raw_values[fallback_mask])
 
         if candidate is None:
             count = min(max(1, raw_values.size // 10), raw_values.size)
             subset = raw_values[:count]
-            finite = subset[np.isfinite(subset)]
-            if finite.size:
-                candidate = float(finite.mean())
-            else:
+            candidate = _robust_baseline_value(subset)
+            if candidate is None:
                 candidate = 0.0
 
         baseline_value = float(candidate if np.isfinite(candidate) else 0.0)
         self._baseline_cache[key] = baseline_value
         return baseline_value
 
-    def _iter_fit_curves(self, event_name: str, channel: str, data: FitData):
+    def _iter_fit_curves(
+        self,
+        event_name: str,
+        channel: str,
+        data: FitData,
+        *,
+        zero_baseline: bool = False,
+    ):
         yielded = False
         skip_baseline = False
         if self._show_fit.get(channel):
@@ -8206,7 +8271,7 @@ class MainWindow(QMainWindow):
             times = np.asarray(time_values, dtype=float)
             values = np.asarray(fit_values, dtype=float)
             baseline_offset = self._estimate_baseline(event_name, channel, times)
-            if baseline_offset and not skip_baseline:
+            if baseline_offset and not skip_baseline and not zero_baseline:
                 values = values + baseline_offset
             n = min(len(times), len(values))
             if n == 0:
@@ -8250,32 +8315,50 @@ class MainWindow(QMainWindow):
             if fit_values.size != base_time.size:
                 continue
             baseline_offset = self._estimate_baseline(event_name, channel, base_time)
-            if baseline_offset and not skip_baseline:
+            if baseline_offset and not skip_baseline and not zero_baseline:
                 fit_values = fit_values + baseline_offset
 
             label = _label_from_param_path(path)
             yield label, base_time, fit_values
 
-    def _plot_fit(self, ax, event_name: str, channel: str, overlay_mode: bool) -> bool:
+    def _plot_fit(
+        self,
+        ax,
+        event_name: str,
+        channel: str,
+        overlay_mode: bool,
+        *,
+        zero_baseline: bool = False,
+        baseline_offset: float = 0.0,
+        line_color: str = "#c1121f",
+    ) -> bool:
         if not self._show_fit.get(channel):
             return False
 
         data = self.get_fit_data(event_name, channel)
         plotted = False
-        for label, time_values, fit_values in self._iter_fit_curves(event_name, channel, data):
+        for label, time_values, fit_values in self._iter_fit_curves(
+            event_name,
+            channel,
+            data,
+            zero_baseline=zero_baseline,
+        ):
             n = min(len(time_values), len(fit_values))
             if n == 0:
                 continue
 
             times = np.asarray(time_values[:n], dtype=float)
             values = np.asarray(fit_values[:n], dtype=float)
+            if zero_baseline:
+                values = values - baseline_offset
 
             ax.plot(
                 times,
                 values,
-                color="#c1121f",
+                color=line_color if overlay_mode else "#c1121f",
                 linewidth=2.4,
-                label=label,
+                linestyle="--" if overlay_mode else "-",
+                label=f"{channel} fit" if overlay_mode else label,
                 zorder=3,
             )[0].set_gid("fit")
 
@@ -8306,6 +8389,23 @@ class MainWindow(QMainWindow):
         ax.grid(True, alpha=0.35)
         ax.tick_params(axis="both", labelsize=font_sizes["tick"], width=1.5, length=7)
         ax.set_ylabel(FAMILY_YLABELS.get(family, "Channel"), fontsize=font_sizes["label"])
+        handles, labels = ax.get_legend_handles_labels()
+        if handles and labels:
+            deduped_handles: List[Any] = []
+            deduped_labels: List[str] = []
+            for handle, label in zip(handles, labels):
+                if not label or label.startswith("_") or label in deduped_labels:
+                    continue
+                deduped_handles.append(handle)
+                deduped_labels.append(label)
+            if deduped_handles:
+                ax.legend(
+                    deduped_handles,
+                    deduped_labels,
+                    loc="upper right",
+                    fontsize=font_sizes["legend"],
+                    framealpha=0.92,
+                )
         show_x = bottom
         ax.tick_params(axis="x", labelbottom=show_x)
         if show_x:
