@@ -294,6 +294,40 @@ def prompt_for_data_file(
     )
     return filename or None
 
+
+def prompt_for_cdf_pair(parent: QWidget) -> Optional[Tuple[str, str]]:
+    """Prompt for an explicit two-file CDF pairing."""
+
+    primary = prompt_for_data_file(parent, preferred="cdf")
+    if not primary:
+        return None
+
+    primary_path = Path(primary).expanduser().resolve()
+    suggested_pair = _find_paired_cdf_path(str(primary_path))
+    secondary_start_dir = (
+        str(suggested_pair.parent)
+        if suggested_pair is not None
+        else str(primary_path.parent)
+    )
+    secondary = prompt_for_data_file(
+        parent,
+        start_dir=secondary_start_dir,
+        preferred="cdf",
+    )
+    if not secondary:
+        return None
+
+    secondary_path = Path(secondary).expanduser().resolve()
+    if secondary_path == primary_path:
+        QMessageBox.warning(
+            parent,
+            "Invalid Pair",
+            "Choose two different CDF files when opening a custom L1B/L2A pair.",
+        )
+        return None
+
+    return str(primary_path), str(secondary_path)
+
 def _normalize_name(value: str) -> str:
     return "".join(ch.lower() for ch in value if ch.isalnum())
 
@@ -1524,11 +1558,20 @@ def _get_event_aid(data_source: "BaseDataSource | None", event: Optional[str]) -
     return None
 
 
-def _format_event_title(filename: str, event: str, timestamp_ms: Optional[float]) -> str:
+def _format_event_title(
+    filename: str,
+    event: str,
+    timestamp_ms: Optional[float],
+    signal_type: Optional[str] = None,
+) -> str:
     title = os.path.basename(filename)
     event_time = _timestamp_to_iso(timestamp_ms)
     if event_time != "Unavailable":
+        if signal_type:
+            return f"{title} — {event_time} — {signal_type}"
         return f"{title} — {event_time}"
+    if signal_type:
+        return f"{title} — Event {event} — {signal_type}"
     return f"{title} — Event {event}"
 
 
@@ -2873,7 +2916,34 @@ class CDFDataSource(BaseDataSource):
         return np.array(slice_data, copy=True)
 
     def list_events(self) -> List[str]:
-        return [str(idx + 1) for idx in range(self._event_count)]
+        if self._event_count <= 0:
+            return []
+
+        def _sort_key(index: int) -> Tuple[int, float, int]:
+            event_name = str(index + 1)
+
+            epoch_seconds = self.get_epoch_seconds(event_name)
+            if epoch_seconds is not None:
+                try:
+                    epoch_value = float(epoch_seconds)
+                except Exception:
+                    epoch_value = float("nan")
+                if np.isfinite(epoch_value):
+                    return (0, epoch_value, index)
+
+            packet_seconds = self.get_packet_time_seconds(event_name)
+            if packet_seconds is not None:
+                try:
+                    packet_value = float(packet_seconds)
+                except Exception:
+                    packet_value = float("nan")
+                if np.isfinite(packet_value):
+                    return (0, packet_value, index)
+
+            return (1, float(index), index)
+
+        ordered_indices = sorted(range(self._event_count), key=_sort_key)
+        return [str(idx + 1) for idx in ordered_indices]
 
     def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
         if dataset_name == "Analysis/DustComposition/CombinedSignal":
@@ -3052,6 +3122,280 @@ class CDFDataSource(BaseDataSource):
         if launch_cdf_viewer is None:
             raise RuntimeError("CDF viewer is not available. Install optional GUI components.")
         return launch_cdf_viewer(self.filename, parent=parent)
+
+
+def _cdf_counterpart_level(level: Optional[str]) -> Optional[str]:
+    if level == "l1b":
+        return "l2a"
+    if level == "l2a":
+        return "l1b"
+    return None
+
+
+def _cdf_pairing_key(path: Path) -> Optional[Tuple[str, str]]:
+    stem = path.stem.lower()
+    match = re.match(r"(?P<prefix>imap_idex_)l[12][ab]_(?P<product>.+?)_(?P<date>\d{8})_v\d+$", stem)
+    if not match:
+        return None
+    return match.group("product"), match.group("date")
+
+
+def _cdf_version(path: Path) -> int:
+    match = re.search(r"_v(\d+)$", path.stem.lower())
+    if not match:
+        return -1
+    try:
+        return int(match.group(1))
+    except Exception:
+        return -1
+
+
+def _find_paired_cdf_path(filename: str) -> Optional[Path]:
+    path = Path(filename).expanduser().resolve()
+    pairing = _cdf_pairing_key(path)
+    if pairing is None:
+        return None
+
+    level_match = re.search(r"_(l[12][ab])_", path.stem.lower())
+    level = level_match.group(1) if level_match else None
+    counterpart = _cdf_counterpart_level(level)
+    if counterpart is None:
+        return None
+
+    product, date_token = pairing
+    candidate_dirs: List[Path] = []
+    sibling = path.parent.parent / counterpart
+    if sibling.exists():
+        candidate_dirs.append(sibling)
+    alternate = path.parent / counterpart
+    if alternate.exists() and alternate not in candidate_dirs:
+        candidate_dirs.append(alternate)
+
+    candidates: List[Path] = []
+    for directory in candidate_dirs:
+        pattern = f"imap_idex_{counterpart}_{product}_{date_token}_v*.cdf"
+        candidates.extend(sorted(directory.glob(pattern)))
+
+    if not candidates:
+        return None
+
+    exact_name = path.name.replace(f"_{level}_", f"_{counterpart}_") if level else None
+    if exact_name:
+        for candidate in candidates:
+            if candidate.name == exact_name:
+                return candidate
+
+    candidates.sort(key=lambda item: (_cdf_version(item), item.name))
+    return candidates[-1]
+
+
+def _merge_fit_data(primary: FitData, secondary: FitData) -> FitData:
+    merged = FitData()
+    merged.time_series.update(primary.time_series)
+    for key, value in secondary.time_series.items():
+        merged.time_series.setdefault(key, value)
+
+    merged.value_series.update(primary.value_series)
+    for key, value in secondary.value_series.items():
+        merged.value_series.setdefault(key, value)
+
+    merged.parameter_series.update(primary.parameter_series)
+    for key, value in secondary.parameter_series.items():
+        merged.parameter_series.setdefault(key, value)
+
+    merged.extras.update(primary.extras)
+    for key, value in secondary.extras.items():
+        merged.extras.setdefault(key, value)
+    return merged
+
+
+class PairedCDFDataSource(BaseDataSource):
+    """Present paired L1B/L2A CDFs as a single quicklook datasource."""
+
+    def __init__(self, filename: str, paired_filename: str):
+        self._requested_source = CDFDataSource(filename)
+        self._paired_source = CDFDataSource(paired_filename)
+
+        requested_level = self._requested_source._product_level
+        if requested_level == "l2a":
+            self._waveform_source = self._paired_source
+            self._fit_source = self._requested_source
+        else:
+            self._waveform_source = self._requested_source
+            self._fit_source = self._paired_source
+
+        super().__init__(self._waveform_source.filename)
+        self.filename = self._waveform_source.filename
+        self.fit_filename = self._fit_source.filename
+        self._event_map = self._build_event_map()
+
+    def close(self) -> None:
+        for source in {self._requested_source, self._paired_source}:
+            try:
+                source.close()
+            except Exception:
+                pass
+
+    def _event_raw_scalar(self, source: CDFDataSource, event: str, varname: str) -> Optional[float]:
+        try:
+            data = source._cached_variable(varname)
+        except Exception:
+            return None
+        if data.size == 0:
+            return None
+        index = source._event_index(event)
+        if index < 0 or index >= data.shape[0]:
+            return None
+        try:
+            value = float(np.asarray(data[index]).reshape(-1)[0])
+        except Exception:
+            return None
+        return value if np.isfinite(value) else None
+
+    def _build_event_map(self) -> Dict[str, str]:
+        waveform_events = self._waveform_source.list_events()
+        fit_events = self._fit_source.list_events()
+        if not waveform_events or not fit_events:
+            return {}
+
+        fit_by_epoch: Dict[int, str] = {}
+        duplicate_epoch = False
+        for event in fit_events:
+            epoch_value = self._event_raw_scalar(self._fit_source, event, "epoch")
+            if epoch_value is None:
+                continue
+            epoch_key = int(round(epoch_value))
+            if epoch_key in fit_by_epoch:
+                duplicate_epoch = True
+                break
+            fit_by_epoch[epoch_key] = event
+
+        event_map: Dict[str, str] = {}
+        if fit_by_epoch and not duplicate_epoch:
+            for event in waveform_events:
+                epoch_value = self._event_raw_scalar(self._waveform_source, event, "epoch")
+                if epoch_value is None:
+                    continue
+                mapped = fit_by_epoch.get(int(round(epoch_value)))
+                if mapped is not None:
+                    event_map[event] = mapped
+            if event_map:
+                return event_map
+
+        if len(waveform_events) == len(fit_events):
+            return dict(zip(waveform_events, fit_events))
+
+        fit_by_index = {idx: event for idx, event in enumerate(fit_events)}
+        for idx, event in enumerate(waveform_events):
+            mapped = fit_by_index.get(idx)
+            if mapped is not None:
+                event_map[event] = mapped
+        return event_map
+
+    def _fit_event(self, event: str) -> str:
+        return self._event_map.get(event, event)
+
+    def list_events(self) -> List[str]:
+        return self._waveform_source.list_events()
+
+    def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
+        fit_event = self._fit_event(event)
+        if dataset_name.startswith("Analysis/"):
+            fit_value = self._fit_source.get_dataset(fit_event, dataset_name)
+            if fit_value is not None:
+                return fit_value
+            return self._waveform_source.get_dataset(event, dataset_name)
+
+        waveform_value = self._waveform_source.get_dataset(event, dataset_name)
+        if waveform_value is not None:
+            return waveform_value
+        return self._fit_source.get_dataset(fit_event, dataset_name)
+
+    def gather_fit_data(self, event: str, channel: str) -> FitData:
+        fit_event = self._fit_event(event)
+        primary = self._fit_source.gather_fit_data(fit_event, channel)
+        secondary = self._waveform_source.gather_fit_data(event, channel)
+        return _merge_fit_data(primary, secondary)
+
+    def channel_definitions(self) -> Dict[str, ChannelDefinition]:
+        return self._waveform_source.channel_definitions()
+
+    def channel_order(self) -> List[str]:
+        return self._waveform_source.channel_order()
+
+    def get_group_attributes(self, event: str, group_path: str) -> Dict[str, Any]:
+        attrs = self._waveform_source.get_group_attributes(event, group_path)
+        if attrs:
+            return attrs
+        return self._fit_source.get_group_attributes(self._fit_event(event), group_path)
+
+    def get_event_attributes(self, event: str) -> Dict[str, Any]:
+        attrs = dict(self._waveform_source.get_event_attributes(event))
+        fit_attrs = self._fit_source.get_event_attributes(self._fit_event(event))
+        for key, value in fit_attrs.items():
+            attrs.setdefault(key, value)
+        return attrs
+
+    def get_global_attributes(self) -> Dict[str, Any]:
+        attrs = dict(self._waveform_source.get_global_attributes())
+        attrs.setdefault("paired_fit_file", self.fit_filename)
+        return attrs
+
+    def event_attribute_rows(self, event: str) -> List[Tuple[str, str, Any]]:
+        rows = list(self._waveform_source.event_attribute_rows(event))
+        fit_rows = self._fit_source.event_attribute_rows(self._fit_event(event))
+        existing = {(path, key) for path, key, _value in rows}
+        for path, key, value in fit_rows:
+            row_key = (path, key)
+            if row_key not in existing:
+                rows.append((path, key, value))
+                existing.add(row_key)
+        rows.sort(key=lambda item: (item[0], item[1]))
+        return rows
+
+    def event_metadata_rows(self, event: str) -> List[Tuple[str, Any, str]]:
+        rows = list(self._waveform_source.event_metadata_rows(event))
+        fit_rows = self._fit_source.event_metadata_rows(self._fit_event(event))
+        existing = {name for name, _value, _shape in rows}
+        for name, value, shape in fit_rows:
+            if name not in existing:
+                rows.append((name, value, shape))
+                existing.add(name)
+        rows.sort(key=lambda item: item[0])
+        return rows
+
+    def list_analysis_datasets(self) -> List[str]:
+        names = list(self._waveform_source.list_analysis_datasets())
+        seen = set(names)
+        for name in self._fit_source.list_analysis_datasets():
+            if name not in seen:
+                names.append(name)
+                seen.add(name)
+        return names
+
+    def get_packet_time_seconds(self, event: str) -> Optional[float]:
+        value = self._waveform_source.get_packet_time_seconds(event)
+        if value is not None:
+            return value
+        return self._fit_source.get_packet_time_seconds(self._fit_event(event))
+
+    def get_epoch_seconds(self, event: str) -> Optional[float]:
+        value = self._waveform_source.get_epoch_seconds(event)
+        if value is not None:
+            return value
+        return self._fit_source.get_epoch_seconds(self._fit_event(event))
+
+    def describe(self) -> str:
+        return (
+            f"{os.path.basename(self.filename)} "
+            f"[fits: {os.path.basename(self.fit_filename)}]"
+        )
+
+    def supports_structure_viewer(self) -> bool:
+        return self._waveform_source.supports_structure_viewer()
+
+    def launch_structure_viewer(self, parent: QWidget | None = None) -> QWidget:
+        return self._waveform_source.launch_structure_viewer(parent=parent)
 
 
 class TRCDataSource(BaseDataSource):
@@ -3238,7 +3582,7 @@ class TRCDataSource(BaseDataSource):
         return f"TRC Directory: {self._directory.name}"
 
 
-def create_data_source(filename: str) -> BaseDataSource:
+def create_data_source(filename: str, paired_filename: Optional[str] = None) -> BaseDataSource:
     """Instantiate the appropriate data source for ``filename``."""
 
     path = Path(filename)
@@ -3249,6 +3593,11 @@ def create_data_source(filename: str) -> BaseDataSource:
     if suffix in {".h5", ".hdf5"}:
         return HDF5DataSource(filename)
     if suffix == ".cdf":
+        if paired_filename is not None:
+            return PairedCDFDataSource(filename, paired_filename)
+        paired_path = _find_paired_cdf_path(filename)
+        if paired_path is not None:
+            return PairedCDFDataSource(filename, str(paired_path))
         return CDFDataSource(filename)
     if suffix == ".trc":
         return TRCDataSource(filename)
@@ -3621,8 +3970,11 @@ def _decode_trigger_origins(trigger_id: int) -> List[str]:
 def _guess_trigger_level(data_source: BaseDataSource, event: str) -> Optional[float]:
     for dataset in _TRIGGER_LEVEL_DATASETS:
         value = _get_dataset_scalar(data_source, event, dataset)
-        if value is not None:
-            return float(value)
+        if value is None:
+            continue
+        value_f = float(value)
+        if np.isfinite(value_f) and value_f > -1.0e20:
+            return value_f
     return None
 
 
@@ -3635,8 +3987,11 @@ def _guess_trigger_level_for_channel(
     if datasets:
         for dataset in datasets:
             value = _get_dataset_scalar(data_source, event, dataset)
-            if value is not None:
-                return float(value)
+            if value is None:
+                continue
+            value_f = float(value)
+            if np.isfinite(value_f) and value_f > -1.0e20:
+                return value_f
     return _guess_trigger_level(data_source, event)
 
 
@@ -3725,6 +4080,32 @@ def _guess_active_trigger_channels(data_source: BaseDataSource, event: str) -> L
     return deduped
 
 
+def _classify_event_signal_type(data_source: Optional[BaseDataSource], event: Optional[str]) -> Optional[str]:
+    if data_source is None or not event:
+        return None
+
+    filename = str(getattr(data_source, "filename", "") or "")
+    if Path(filename).suffix.lower() != ".cdf":
+        return None
+
+    origins = _guess_trigger_origins(data_source, event)
+    origin_tokens = [origin.strip().lower() for origin in origins if origin and str(origin).strip()]
+    configured_channels = _guess_active_trigger_channels(data_source, event)
+    configured_set = set(configured_channels)
+
+    has_software_trigger = any("sw trigger" in token or "external trigger" in token for token in origin_tokens)
+
+    if not configured_channels:
+        return "Noise"
+    if has_software_trigger and configured_set <= {"TOF H"}:
+        return "Noise"
+    if configured_set == {"TOF H"}:
+        return "Pulsar"
+    if len(configured_set) >= 2 or any(channel != "TOF H" for channel in configured_set):
+        return "Science"
+    return "Science"
+
+
 def _guess_trigger_mode(data_source: BaseDataSource, event: str) -> Optional[str]:
     for dataset in _TRIGGER_MODE_DATASETS:
         text = _get_dataset_text(data_source, event, dataset)
@@ -3756,6 +4137,16 @@ def _timestamp_to_iso(ms: Optional[float]) -> str:
     except Exception:
         return f"{ms:.0f} ms"
     return dt.isoformat()
+
+
+def _format_event_dropdown_timestamp(ms: Optional[float]) -> Optional[str]:
+    if ms is None or not np.isfinite(ms):
+        return None
+    try:
+        dt = datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc)
+    except Exception:
+        return None
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _format_delta_ms(delta_ms: Optional[float]) -> str:
@@ -5001,6 +5392,7 @@ class MainWindow(QMainWindow):
         self._events: List[str] = []
         self._current_event: Optional[str] = None
         self._filename: Optional[str] = None
+        self._paired_filename: Optional[str] = None
         self._h5: Optional[Any] = None
         self._tmpdir = tempfile.TemporaryDirectory(prefix="idex_quicklook_")
         self._fit_cache: Dict[Tuple[str, str], FitData] = {}
@@ -5222,6 +5614,12 @@ class MainWindow(QMainWindow):
         self.open_cdf_action = QAction("Open CDF…", self)
         self.open_cdf_action.triggered.connect(lambda: self.action_open(preferred="cdf"))
 
+        self.open_cdf_pair_action = QAction("Open CDF Pair…", self)
+        self.open_cdf_pair_action.setStatusTip(
+            "Open a custom L1B/L2A CDF pairing for overlay comparisons",
+        )
+        self.open_cdf_pair_action.triggered.connect(self.action_open_cdf_pair)
+
         self.open_trc_action = QAction("Open Trace Directory…", self)
         self.open_trc_action.triggered.connect(lambda: self.action_open(preferred="trc"))
 
@@ -5314,6 +5712,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.open_any_action)
         file_menu.addAction(self.open_hdf5_action)
         file_menu.addAction(self.open_cdf_action)
+        file_menu.addAction(self.open_cdf_pair_action)
         file_menu.addAction(self.open_trc_action)
         file_menu.addSeparator()
 
@@ -5442,6 +5841,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.open_any_action)
         tb.addAction(self.open_hdf5_action)
         tb.addAction(self.open_cdf_action)
+        tb.addAction(self.open_cdf_pair_action)
         tb.addSeparator()
         tb.addAction(self.reload_action)
 
@@ -5830,6 +6230,7 @@ class MainWindow(QMainWindow):
             # ("Open…", lambda: self.open_any_action.trigger(), "Open an HDF5 or CDF file"),
             # ("Open HDF5", lambda: self.open_hdf5_action.trigger(), "Open an HDF5 data file"),
             # ("Open CDF", lambda: self.open_cdf_action.trigger(), "Open a CDF data file"),
+            ("Open CDF Pair", self.action_open_cdf_pair, "Open a custom L1B/L2A CDF pairing"),
             # ("Reload", self.reload_current, "Reload the current file"),
             # ("Close File", lambda: self.close_file_action.trigger(), "Close the current data file"),
             # ("Save PNG", lambda: self.save_plot("png"), "Save the current plot as a PNG image"),
@@ -6129,7 +6530,19 @@ class MainWindow(QMainWindow):
 
         self.event_combo.blockSignals(True)
         self.event_combo.clear()
-        self.event_combo.addItems(list(events))
+        for event_name in events:
+            timestamp_ms = _guess_event_timestamp_ms(self._data_source, event_name) if self._data_source else None
+            timestamp_text = _format_event_dropdown_timestamp(timestamp_ms)
+            signal_type = _classify_event_signal_type(self._data_source, event_name)
+            if timestamp_text and signal_type:
+                label = f"{timestamp_text} | {signal_type}  [Event {event_name}]"
+            elif timestamp_text:
+                label = f"{timestamp_text}  [Event {event_name}]"
+            elif signal_type:
+                label = f"{signal_type}  [Event {event_name}]"
+            else:
+                label = f"Event {event_name}"
+            self.event_combo.addItem(label, event_name)
         if selected_event is not None:
             self.event_combo.setCurrentIndex(list(events).index(selected_event))
         self.event_combo.blockSignals(False)
@@ -6720,6 +7133,13 @@ class MainWindow(QMainWindow):
         chosen = prompt_for_data_file(self, preferred=preferred)
         if chosen:
             self.open_file(chosen)
+
+    def action_open_cdf_pair(self) -> None:
+        pair = prompt_for_cdf_pair(self)
+        if not pair:
+            return
+        primary, secondary = pair
+        self.open_file(primary, paired_path=secondary)
 
     def action_view_structure(self):
         if not self._filename or not self._data_source:
@@ -7490,6 +7910,7 @@ class MainWindow(QMainWindow):
         self._data_source = None
         self._all_events = []
         self._filename = None
+        self._paired_filename = None
         self._events = []
         self._current_event = None
         self._interesting_event_matches = []
@@ -7503,6 +7924,9 @@ class MainWindow(QMainWindow):
         self._rise_metric_cache.clear()
         self._low_rate_waveform_cache.clear()
         self._show_fit = {name: False for name in FIT_ELIGIBLE_CHANNELS}
+        for btn in self.fit_buttons.values():
+            with QSignalBlocker(btn):
+                btn.setChecked(False)
 
         self.event_combo.blockSignals(True)
         self.event_combo.clear()
@@ -7694,7 +8118,12 @@ class MainWindow(QMainWindow):
                 except Exception:
                     continue
 
-    def open_file(self, path: str, preferred_event: Optional[str] = None):
+    def open_file(
+        self,
+        path: str,
+        preferred_event: Optional[str] = None,
+        paired_path: Optional[str] = None,
+    ):
         self._reset_state()
 
         suffix = Path(path).suffix.lower()
@@ -7706,7 +8135,7 @@ class MainWindow(QMainWindow):
                     h5_handle = h5py.File(path, "r+")
                 except OSError:
                     h5_handle = h5py.File(path, "r")
-            source = create_data_source(path)
+            source = create_data_source(path, paired_path)
         except ImportError as exc:
             QMessageBox.critical(
                 self,
@@ -7746,6 +8175,7 @@ class MainWindow(QMainWindow):
         self._h5 = h5_handle
         self._data_source = source
         self._filename = path
+        self._paired_filename = paired_path
         self._rebuild_channel_buttons()
         self._update_viewer_action_states()
 
@@ -7776,9 +8206,19 @@ class MainWindow(QMainWindow):
 
     def reload_current(self):
         if self._filename:
-            self.open_file(self._filename, preferred_event=self._current_event)
+            self.open_file(
+                self._filename,
+                preferred_event=self._current_event,
+                paired_path=self._paired_filename,
+            )
 
     def on_event_changed(self, idx: int):
+        if idx < 0:
+            return
+        event_name = self.event_combo.itemData(idx)
+        if isinstance(event_name, str) and event_name in self._events:
+            self.plot_event(event_name)
+            return
         if 0 <= idx < len(self._events):
             self.plot_event(self._events[idx])
 
@@ -7855,8 +8295,9 @@ class MainWindow(QMainWindow):
         missing: List[str] = []
 
         timestamp_ms = _guess_event_timestamp_ms(self._data_source, event_name)
+        signal_type = _classify_event_signal_type(self._data_source, event_name)
         self.figure.suptitle(
-            _format_event_title(self._filename or "", event_name, timestamp_ms),
+            _format_event_title(self._filename or "", event_name, timestamp_ms, signal_type),
             fontsize=self._plot_font_sizes()["title"],
             fontweight="bold",
         )
@@ -8261,6 +8702,10 @@ class MainWindow(QMainWindow):
     ):
         yielded = False
         skip_baseline = False
+        fit_values_include_baseline = isinstance(
+            self._data_source,
+            (CDFDataSource, PairedCDFDataSource),
+        )
         if self._show_fit.get(channel):
             filtered = self._get_dataset(event_name, f"Analysis/{channel} Filtered Signal")
             if filtered is not None:
@@ -8271,12 +8716,28 @@ class MainWindow(QMainWindow):
             times = np.asarray(time_values, dtype=float)
             values = np.asarray(fit_values, dtype=float)
             baseline_offset = self._estimate_baseline(event_name, channel, times)
-            if baseline_offset and not skip_baseline and not zero_baseline:
+            if (
+                baseline_offset
+                and not skip_baseline
+                and not zero_baseline
+                and not fit_values_include_baseline
+            ):
                 values = values + baseline_offset
             n = min(len(times), len(values))
             if n == 0:
                 continue
-            yield label, times[:n], values[:n]
+            fit_t0 = None
+            for path, raw_params in data.iter_parameter_items():
+                if _label_from_param_path(path) != label:
+                    continue
+                param_array = _coerce_parameter_values(raw_params)
+                if param_array is None or param_array.size == 0:
+                    continue
+                candidate = float(param_array[0])
+                if np.isfinite(candidate):
+                    fit_t0 = candidate
+                    break
+            yield label, times[:n], values[:n], fit_t0
             yielded = True
 
         if yielded or not data.parameter_series or not self._data_source:
@@ -8315,11 +8776,21 @@ class MainWindow(QMainWindow):
             if fit_values.size != base_time.size:
                 continue
             baseline_offset = self._estimate_baseline(event_name, channel, base_time)
-            if baseline_offset and not skip_baseline and not zero_baseline:
+            if (
+                baseline_offset
+                and not skip_baseline
+                and not zero_baseline
+                and not fit_values_include_baseline
+            ):
                 fit_values = fit_values + baseline_offset
 
             label = _label_from_param_path(path)
-            yield label, base_time, fit_values
+            fit_t0 = None
+            if param_array.size > 0:
+                candidate = float(param_array[0])
+                if np.isfinite(candidate):
+                    fit_t0 = candidate
+            yield label, base_time, fit_values, fit_t0
 
     def _plot_fit(
         self,
@@ -8337,7 +8808,7 @@ class MainWindow(QMainWindow):
 
         data = self.get_fit_data(event_name, channel)
         plotted = False
-        for label, time_values, fit_values in self._iter_fit_curves(
+        for label, time_values, fit_values, fit_t0 in self._iter_fit_curves(
             event_name,
             channel,
             data,
@@ -8356,11 +8827,22 @@ class MainWindow(QMainWindow):
                 times,
                 values,
                 color=line_color if overlay_mode else "#c1121f",
-                linewidth=2.4,
+                linewidth=1.9,
                 linestyle="--" if overlay_mode else "-",
                 label=f"{channel} fit" if overlay_mode else label,
+                alpha=0.8,
                 zorder=3,
             )[0].set_gid("fit")
+
+            if channel in RISE_METRIC_CHANNELS and fit_t0 is not None:
+                ax.axvline(
+                    fit_t0,
+                    color=line_color if overlay_mode else "#c1121f",
+                    linestyle="--",
+                    linewidth=1.4,
+                    alpha=0.8,
+                    zorder=2.8,
+                )
 
             if channel in RISE_METRIC_CHANNELS:
                 metrics = self._ensure_rise_metrics(event_name, channel, times, values)
@@ -8373,7 +8855,7 @@ class MainWindow(QMainWindow):
                     edgecolors="white",
                     linewidths=1.2,
                     zorder=4,
-                    s=70,
+                    s=35,
                 )
                 if np.isfinite(t10) and np.isfinite(v10):
                     ax.scatter([t10], [v10], **marker_kwargs)
@@ -8477,6 +8959,8 @@ class MainWindow(QMainWindow):
                 self._show_fit[channel] = False
                 btn.setToolTip("No fit curve found for this event.")
             else:
+                with QSignalBlocker(btn):
+                    btn.setChecked(bool(self._show_fit.get(channel)))
                 btn.setToolTip("Overlay the available fit curve on the channel plot.")
         self._set_edit_fit_controls_enabled(has_editable)
 
@@ -8484,6 +8968,9 @@ class MainWindow(QMainWindow):
         parts: List[str] = []
         event_label = self._current_event or "–"
         parts.append(f"Event {event_label}")
+        signal_type = _classify_event_signal_type(self._data_source, self._current_event)
+        if signal_type:
+            parts.append(f"Type: {signal_type}")
 
         channels = [ch for ch in self._channel_order() if ch in self.selected_channels and self.channel_buttons.get(ch) and self.channel_buttons[ch].isChecked()]
         parts.append("Channels: " + (", ".join(channels) if channels else "none"))
