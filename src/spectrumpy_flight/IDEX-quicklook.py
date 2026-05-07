@@ -2108,6 +2108,11 @@ class BaseDataSource(ABC):
     def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
         """Return the dataset for ``/{event}/{dataset_name}`` or ``None``."""
 
+    def get_dataset_attributes(self, event: str, dataset_name: str) -> Dict[str, Any]:
+        """Return per-dataset attributes for ``dataset_name`` within ``event``."""
+
+        return {}
+
     @abstractmethod
     def gather_fit_data(self, event: str, channel: str) -> FitData:
         """Collect fit products for ``channel`` within ``event``."""
@@ -2235,6 +2240,25 @@ class HDF5DataSource(BaseDataSource):
         if dataset_name == "Analysis/DustComposition/CombinedTime":
             return self._combined_time(event)
         return self._read_dataset(event, dataset_name)
+
+    def get_dataset_attributes(self, event: str, dataset_name: str) -> Dict[str, Any]:
+        if dataset_name in self.SYNTHETIC_COMBINED_DATASETS:
+            for candidate in ("TOF H", "TOF M", "TOF L"):
+                attrs = self.get_dataset_attributes(event, candidate)
+                if attrs:
+                    return attrs
+            return {}
+        path = f"/{event}/{dataset_name}"
+        try:
+            obj = self._file[path]
+        except Exception:
+            return {}
+        if not isinstance(obj, h5py.Dataset):
+            return {}
+        result: Dict[str, Any] = {}
+        for key, value in obj.attrs.items():
+            result[str(key)] = _normalise_attr_value(value)
+        return result
 
     def get_group_attributes(self, event: str, group_path: str) -> Dict[str, Any]:
         cleaned = group_path.strip("/")
@@ -2991,6 +3015,38 @@ class CDFDataSource(BaseDataSource):
             return None
         return np.array(slice_data, copy=True)
 
+    def get_dataset_attributes(self, event: str, dataset_name: str) -> Dict[str, Any]:
+        if dataset_name == "Analysis/DustComposition/CombinedSignal":
+            for candidate in ("TOF H", "TOF M", "TOF L"):
+                attrs = self.get_dataset_attributes(event, candidate)
+                if attrs:
+                    return attrs
+            return {}
+        if dataset_name == "Analysis/DustComposition/CombinedTime":
+            dataset_name = "Time (high sampling)"
+
+        varname = self.DATASET_MAP.get(dataset_name)
+        if not varname:
+            analysis_name = dataset_name.split("/", 1)[1] if dataset_name.startswith("Analysis/") else ""
+            mapping = self.ANALYSIS_DATASET_MAP.get(analysis_name)
+            if mapping:
+                varname, _mode = mapping
+            else:
+                return {}
+        try:
+            attrs = self._cdf.varattsget(varname, expand=True) or {}
+        except Exception:
+            try:
+                attrs = self._cdf.varattsget(varname) or {}
+            except Exception:
+                return {}
+        if not isinstance(attrs, dict):
+            try:
+                attrs = dict(attrs)
+            except Exception:
+                return {}
+        return {str(key): _normalise_attr_value(value) for key, value in attrs.items()}
+
     def get_global_attributes(self) -> Dict[str, Any]:
         try:
             attrs = self._cdf.globalattsget(expand=True) or {}
@@ -3310,6 +3366,18 @@ class PairedCDFDataSource(BaseDataSource):
         if waveform_value is not None:
             return waveform_value
         return self._fit_source.get_dataset(fit_event, dataset_name)
+
+    def get_dataset_attributes(self, event: str, dataset_name: str) -> Dict[str, Any]:
+        fit_event = self._fit_event(event)
+        if dataset_name.startswith("Analysis/"):
+            attrs = self._fit_source.get_dataset_attributes(fit_event, dataset_name)
+            if attrs:
+                return attrs
+            return self._waveform_source.get_dataset_attributes(event, dataset_name)
+        attrs = self._waveform_source.get_dataset_attributes(event, dataset_name)
+        if attrs:
+            return attrs
+        return self._fit_source.get_dataset_attributes(fit_event, dataset_name)
 
     def gather_fit_data(self, event: str, channel: str) -> FitData:
         fit_event = self._fit_event(event)
@@ -5361,19 +5429,21 @@ def launch_sql_matcher_window(
     return dialog
 
 
-Y_AXIS_LABELS: Dict[str, str] = {
-    "Target L": r"$Q_{TL}$ [pC]",
-    "Target H": r"$Q_{TH}$ [pC]",
-    "Ion Grid": r"$Q_{IG}$ [pC]",
-    "TOF L": r"$TOF_{L}$ [pC/ $\Delta t$]",
-    "TOF M": r"$TOF_{M}$ [pC/ $\Delta t$]",
-    "TOF H": r"$TOF_{H}$ [pC/ $\Delta t$]",
-    "TOF Combined": r"$TOF_{combined}$ [pC/ $\Delta t$]",
+Y_AXIS_BASE_LABELS: Dict[str, str] = {
+    "Target L": r"$Q_{TL}$",
+    "Target H": r"$Q_{TH}$",
+    "Ion Grid": r"$Q_{IG}$",
+    "TOF L": r"$TOF_{L}$",
+    "TOF M": r"$TOF_{M}$",
+    "TOF H": r"$TOF_{H}$",
+    "TOF Combined": r"$TOF_{combined}$",
 }
 
 
-def y_label_with_units(channel_name: str) -> str:
-    return Y_AXIS_LABELS.get(channel_name, channel_name)
+def y_label_with_units(channel_name: str, unit: Optional[str] = None) -> str:
+    base = Y_AXIS_BASE_LABELS.get(channel_name, channel_name)
+    cleaned_unit = str(unit).strip() if unit is not None else ""
+    return f"{base} [{cleaned_unit}]" if cleaned_unit else base
 
 # --------- Main Window ---------
 class MainWindow(QMainWindow):
@@ -5566,6 +5636,45 @@ class MainWindow(QMainWindow):
         # if scale != 1.0:
         #     arr = arr / scale
         return arr
+
+    def _channel_unit(self, event_name: str, channel: str) -> Optional[str]:
+        if not self._data_source:
+            return None
+        definition = self._channel_definition(channel)
+        if not definition:
+            return None
+        attrs = self._data_source.get_dataset_attributes(event_name, definition.dataset)
+        for key in ("units", "UNITS", "Units"):
+            value = attrs.get(key)
+            if value is None:
+                continue
+            candidate = value
+            if isinstance(candidate, np.ndarray):
+                flat = np.asarray(candidate, dtype=object).reshape(-1)
+                if flat.size == 0:
+                    continue
+                candidate = flat[0]
+            elif isinstance(candidate, (list, tuple)):
+                if not candidate:
+                    continue
+                candidate = candidate[0]
+            unit = str(candidate).strip()
+            if unit:
+                return unit
+        return None
+
+    def _channel_y_label(self, event_name: str, channel: str) -> str:
+        return y_label_with_units(channel, self._channel_unit(event_name, channel))
+
+    def _family_y_label(self, event_name: str, family: str) -> str:
+        if not self._data_source:
+            return FAMILY_YLABELS.get(family, "Channel")
+        channel_defs = self._data_source.channel_definitions()
+        for channel in self._data_source.channel_order():
+            definition = channel_defs.get(channel)
+            if definition and definition.family == family:
+                return self._channel_y_label(event_name, channel)
+        return FAMILY_YLABELS.get(family, "Channel")
 
     # ---- UI construction -------------------------------------------------
     def _apply_modern_palette(self) -> None:
@@ -8369,7 +8478,7 @@ class MainWindow(QMainWindow):
                         plotted_any = False
                         for channel in channels:
                             plotted_any |= self._plot_channel(ax, event_name, channel, overlay_mode=True, missing_channels=missing)
-                        self._style_overlay_axis(ax, family, bottom=(idx == len(families)))
+                        self._style_overlay_axis(ax, event_name, family, bottom=(idx == len(families)))
             else:
                 ordered = [ch for ch in channel_order if ch in selected]
                 if not ordered:
@@ -8604,7 +8713,7 @@ class MainWindow(QMainWindow):
         if base_plotted or fit_plotted:
             self._plot_trigger_level(ax, event_name, channel, baseline_offset=baseline_offset if zero_baseline else 0.0)
             if not overlay_mode:
-                ax.set_ylabel(y_label_with_units(channel), fontsize=self._plot_font_sizes()["label"])
+                ax.set_ylabel(self._channel_y_label(event_name, channel), fontsize=self._plot_font_sizes()["label"])
             return True
 
         if reason:
@@ -8865,12 +8974,12 @@ class MainWindow(QMainWindow):
             plotted = True
         return plotted
 
-    def _style_overlay_axis(self, ax, family: str, bottom: bool):
+    def _style_overlay_axis(self, ax, event_name: str, family: str, bottom: bool):
         font_sizes = self._plot_font_sizes()
         ax.set_facecolor("#f8f9fb")
         ax.grid(True, alpha=0.35)
         ax.tick_params(axis="both", labelsize=font_sizes["tick"], width=1.5, length=7)
-        ax.set_ylabel(FAMILY_YLABELS.get(family, "Channel"), fontsize=font_sizes["label"])
+        ax.set_ylabel(self._family_y_label(event_name, family), fontsize=font_sizes["label"])
         handles, labels = ax.get_legend_handles_labels()
         if handles and labels:
             deduped_handles: List[Any] = []
@@ -9603,6 +9712,15 @@ class FitParameterDialog(QDialog):
         self._refresh_channel_combo()
         self._update_action_states()
 
+    def _channel_y_label(self, channel: str) -> str:
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_channel_y_label"):
+            try:
+                return parent._channel_y_label(self._event_name, channel)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return y_label_with_units(channel)
+
     # ---- UI helpers -----------------------------------------------------
     def _ingest_channel_data(self, channel_data: Dict[str, FitData]) -> None:
         self._channel_data = dict(channel_data)
@@ -10210,7 +10328,7 @@ class FitParameterDialog(QDialog):
         ax.set_xlabel("Time (µs)")
         channel_label = self._current_channel or ""
         if channel_label:
-            ax.set_ylabel(y_label_with_units(channel_label))
+            ax.set_ylabel(self._channel_y_label(channel_label))
         else:
             ax.set_ylabel("Value")
         ax.set_facecolor("#f8f9fb")
@@ -10496,7 +10614,7 @@ class FitParameterDialog(QDialog):
                             show_overlay = True
 
         self.preview_ax.set_xlabel("Time (µs)")
-        self.preview_ax.set_ylabel(y_label_with_units(channel))
+        self.preview_ax.set_ylabel(self._channel_y_label(channel))
         self.preview_ax.grid(True, alpha=0.35)
         if show_overlay:
             self.preview_ax.legend(loc="upper right")
