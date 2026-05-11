@@ -286,10 +286,57 @@ def _parse_filename_epoch(filename: str) -> Tuple[Optional[datetime], bool]:
         return (None, False)
 
 
+IMAP_SC_ID = -43
+_SPICE_TIME_KERNELS_READY: Optional[bool] = None
+
+
+def _spice_kernel_candidates() -> Tuple[List[Path], List[Path]]:
+    repo_root = Path(__file__).resolve().parents[3]
+    sclk_candidates = [
+        package_path("CDF", "imap_sclk_0161.tsc"),
+        repo_root / "imap_processing" / "data" / "imap" / "spice" / "sclk" / "imap_sclk_0162.tsc",
+        repo_root / "imap_processing" / "data" / "imap" / "spice" / "sclk" / "imap_sclk_0130.tsc",
+        repo_root / "imap_processing" / "data" / "imap" / "spice" / "sclk" / "imap_sclk_0069.tsc",
+        repo_root / "imap_processing" / "imap_processing" / "tests" / "spice" / "test_data" / "imap_sclk_0036.tsc",
+        repo_root / "imap_processing" / "imap_processing" / "tests" / "spice" / "test_data" / "imap_sclk_0000.tsc",
+    ]
+    lsk_candidates = [
+        repo_root / "imap_processing" / "data" / "imap" / "spice" / "lsk" / "naif0012.tls",
+        repo_root / "imap_processing" / "imap_processing" / "tests" / "spice" / "test_data" / "naif0012.tls",
+    ]
+    return sclk_candidates, lsk_candidates
+
+
+def _ensure_spice_time_kernels() -> bool:
+    global _SPICE_TIME_KERNELS_READY
+    if _SPICE_TIME_KERNELS_READY is not None:
+        return _SPICE_TIME_KERNELS_READY
+    if spice is None:
+        _SPICE_TIME_KERNELS_READY = False
+        return False
+
+    sclk_candidates, lsk_candidates = _spice_kernel_candidates()
+    sclk_path = next((path for path in sclk_candidates if path.exists()), None)
+    lsk_path = next((path for path in lsk_candidates if path.exists()), None)
+    if sclk_path is None or lsk_path is None:
+        _SPICE_TIME_KERNELS_READY = False
+        return False
+
+    try:
+        spice.furnsh(str(lsk_path))
+        spice.furnsh(str(sclk_path))
+    except Exception:
+        _SPICE_TIME_KERNELS_READY = False
+        return False
+
+    _SPICE_TIME_KERNELS_READY = True
+    return True
+
+
 def _utc_to_et(utc_iso: Optional[str]) -> Optional[float]:
     """Convert a UTC timestamp string to SPICE ET when SPICE is available."""
 
-    if utc_iso is None or spice is None:
+    if utc_iso is None or spice is None or not _ensure_spice_time_kernels():
         return None
     try:
         return float(spice.str2et(utc_iso))
@@ -300,12 +347,30 @@ def _utc_to_et(utc_iso: Optional[str]) -> Optional[float]:
 def _et_to_utc(eta: Optional[float]) -> Optional[str]:
     """Convert SPICE ET to a UTC timestamp string when SPICE is available."""
 
-    if eta is None or spice is None:
+    if eta is None or spice is None or not _ensure_spice_time_kernels():
         return None
     try:
         return str(spice.et2utc(float(eta), "ISOC", 6)) + "Z"
     except Exception:
         return None
+
+
+def _met_to_et(met_seconds: Optional[float]) -> Optional[float]:
+    """Convert spacecraft MET seconds to SPICE ET via the IMAP SCLK kernel."""
+
+    if met_seconds is None or spice is None or not _ensure_spice_time_kernels():
+        return None
+    try:
+        sclk_ticks = float(met_seconds) / 20.0e-6
+        return float(spice.sct2e(IMAP_SC_ID, sclk_ticks))
+    except Exception:
+        return None
+
+
+def _met_to_utc(met_seconds: Optional[float]) -> Optional[str]:
+    """Convert spacecraft MET seconds to UTC using SPICE SCLK conversion."""
+
+    return _et_to_utc(_met_to_et(met_seconds))
 
 
 def _txhdr_time_fields(
@@ -339,8 +404,12 @@ def _txhdr_time_fields(
         }
 
     utc_time = (SPACECRAFT_EPOCH + timedelta(seconds=epoch_seconds)).replace(tzinfo=timezone.utc)
-    utc_timestamp_instrument = utc_time.isoformat().replace("+00:00", "Z")
-    et_instrument = _utc_to_et(utc_timestamp_instrument)
+    utc_timestamp_approx = utc_time.isoformat().replace("+00:00", "Z")
+    et_instrument = _met_to_et(epoch_seconds)
+    utc_timestamp_instrument = _met_to_utc(epoch_seconds)
+    if utc_timestamp_instrument is None:
+        utc_timestamp_instrument = utc_timestamp_approx
+        et_instrument = _utc_to_et(utc_timestamp_instrument)
     et_converted = et_instrument
     utc_timestamp_converted = _et_to_utc(et_converted)
     return {
@@ -2756,7 +2825,7 @@ class IDEXEvent:
                         maxsamples = (pkt.data['IDX__TXHDRLGTRIGCTRL1'].derived_value >> 11) & mask_11_bit
                         # Extract the last 10 bits (bits 0-9)
                         trigger_counts = (pkt.data['IDX__TXHDRLGTRIGCTRL1'].derived_value >> 22) & mask_10_bit
-                        lg_trigger_level = 5.14e-4 * trigger_counts
+                        lg_trigger_level = 5.14e-1 * trigger_counts
                         self.header[(evtnum, 'LGTriggerLevel')] = lg_trigger_level
                         self.header[(evtnum, 'TriggerLevel')] = lg_trigger_level
                         print(f"Trigger level = {lg_trigger_level}")
@@ -3182,7 +3251,7 @@ class IDEXEvent:
         conversion_factors = {
             "TOF H": 2.89e-4,
             "TOF M": 1.13e-2,
-            "TOF L": 5.14e-4,
+            "TOF L": 5.14e-1,
             "Ion Grid": 7.46e-4,
             "Target H": 1.63e-1,
             "Target L": 1.58e1,
@@ -3359,7 +3428,7 @@ class IDEXEvent:
         conversion_factors = {
             'TOF H': 2.89e-4,
             'TOF M': 1.13e-2,
-            'TOF L': 5.14e-4,
+            'TOF L': 5.14e-1,
             'Ion Grid': 7.46e-4,
             'Target H': 1.63e-1,
             'Target L': 1.58e1,

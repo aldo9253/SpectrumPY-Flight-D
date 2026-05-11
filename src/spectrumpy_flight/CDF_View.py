@@ -465,10 +465,62 @@ class CDFViewWindow(QMainWindow):
         event.accept()
 
 
+class TabbedCDFViewWindow(QMainWindow):
+    """Host multiple CDF viewers in one tabbed window."""
+
+    def __init__(
+        self,
+        sources: Sequence[Tuple[str, str]],
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self._child_viewers: List[CDFViewWindow] = []
+        self._tabs = QTabWidget(self)
+        self.setCentralWidget(self._tabs)
+        self.resize(1240, 820)
+
+        labels: List[str] = []
+        for label, filename in sources:
+            viewer = CDFViewWindow(filename, parent=self._tabs)
+            viewer.setWindowFlags(Qt.WindowType.Widget)
+            self._tabs.addTab(viewer, label)
+            self._child_viewers.append(viewer)
+            labels.append(label)
+
+        label_text = " / ".join(labels) if labels else "CDF Sources"
+        self.setWindowTitle(f"CDF View — {label_text}")
+
+    def closeEvent(self, event):  # pragma: no cover - GUI teardown
+        for viewer in self._child_viewers:
+            try:
+                viewer.close()
+            except Exception:
+                pass
+        self._child_viewers.clear()
+        event.accept()
+
+
 def launch_cdf_viewer(filename: str, parent: Optional[QWidget] = None) -> QWidget:
     """Launch the CDF viewer window and return it for bookkeeping."""
 
     window = CDFViewWindow(filename, parent=parent)
+    window.show()
+    return window
+
+
+def launch_multi_cdf_viewer(
+    sources: Sequence[Tuple[str, str]],
+    parent: Optional[QWidget] = None,
+) -> QWidget:
+    """Launch a tabbed viewer for multiple CDF files."""
+
+    if not sources:
+        raise ValueError("At least one CDF source is required.")
+    if len(sources) == 1:
+        _label, filename = sources[0]
+        return launch_cdf_viewer(filename, parent=parent)
+
+    window = TabbedCDFViewWindow(sources, parent=parent)
     window.show()
     return window
 

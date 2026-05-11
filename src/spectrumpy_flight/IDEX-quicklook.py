@@ -111,9 +111,10 @@ except Exception:  # pragma: no cover
     launch_hdf_viewer = None
 
 try:  # pragma: no cover - optional dependency, loaded lazily
-    from spectrumpy_flight.CDF_View import launch_cdf_viewer
+    from spectrumpy_flight.CDF_View import launch_cdf_viewer, launch_multi_cdf_viewer
 except Exception:  # pragma: no cover
     launch_cdf_viewer = None
+    launch_multi_cdf_viewer = None
 
 try:  # pragma: no cover - optional dependency
     from spectrumpy_flight.IDEX_Definitions_View import launch_variable_definitions_viewer
@@ -1976,24 +1977,25 @@ class FitData:
             yield path, np.asarray(values)
 
 
-class EventDataDialog(QDialog):
-    """Tabbed viewer for the currently selected event's metadata and datasets."""
+@dataclass(frozen=True)
+class EventDataSection:
+    label: str
+    summary_text: str
+    global_attributes: Dict[str, Any]
+    event_attributes: List[Tuple[str, str, Any]]
+    event_metadata: List[Tuple[str, Any, str]]
+
+
+class _EventDataSectionWidget(QWidget):
+    """One event-data page containing summary, attributes, and variables."""
 
     def __init__(
         self,
-        parent: QWidget,
+        parent: QWidget | None = None,
         *,
-        summary_text: str,
-        global_attributes: Dict[str, Any],
-        event_attributes: List[Tuple[str, str, Any]],
-        event_metadata: List[Tuple[str, Any, str]],
+        section: EventDataSection,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Event Data")
-        self.resize(1040, 760)
-        self.setModal(False)
-        self.setWindowModality(Qt.WindowModality.NonModal)
-
         layout = QVBoxLayout(self)
         self._tabs = QTabWidget(self)
         layout.addWidget(self._tabs)
@@ -2028,42 +2030,30 @@ class EventDataDialog(QDialog):
         self._event_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._tabs.addTab(self._event_table, "Current Event")
 
-        btn_close = QPushButton("Close", self)
-        btn_close.clicked.connect(self.hide)
-        layout.addWidget(btn_close)
-
-        self.update_contents(
-            summary_text=summary_text,
-            global_attributes=global_attributes,
-            event_attributes=event_attributes,
-            event_metadata=event_metadata,
-        )
+        self.update_contents(section=section)
 
     def update_contents(
         self,
         *,
-        summary_text: str,
-        global_attributes: Dict[str, Any],
-        event_attributes: List[Tuple[str, str, Any]],
-        event_metadata: List[Tuple[str, Any, str]],
+        section: EventDataSection,
     ) -> None:
-        self._summary_box.setPlainText(summary_text)
+        self._summary_box.setPlainText(section.summary_text)
         self._populate_table(
             self._attrs_table,
             [
-                (str(key), _stringify_event_data_value(global_attributes[key]))
-                for key in sorted(global_attributes)
+                (str(key), _stringify_event_data_value(section.global_attributes[key]))
+                for key in sorted(section.global_attributes)
             ],
         )
         event_attrs_index = self._tabs.indexOf(self._event_attrs_table)
-        if event_attributes:
+        if section.event_attributes:
             if event_attrs_index < 0:
                 self._tabs.insertTab(2, self._event_attrs_table, "Event Attributes")
             self._populate_table(
                 self._event_attrs_table,
                 [
                     (path, name, _stringify_event_data_value(value))
-                    for path, name, value in event_attributes
+                    for path, name, value in section.event_attributes
                 ],
             )
         elif event_attrs_index >= 0:
@@ -2072,7 +2062,7 @@ class EventDataDialog(QDialog):
             self._event_table,
             [
                 (name, _stringify_event_data_value(value), shape_text)
-                for name, value, shape_text in event_metadata
+                for name, value, shape_text in section.event_metadata
             ],
         )
 
@@ -2083,6 +2073,38 @@ class EventDataDialog(QDialog):
             for col_index, value in enumerate(row_values):
                 table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
         table.resizeRowsToContents()
+
+
+class EventDataDialog(QDialog):
+    """Tabbed viewer for the currently selected event's metadata and datasets."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        sections: List[EventDataSection],
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Event Data")
+        self.resize(1040, 760)
+        self.setModal(False)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+
+        layout = QVBoxLayout(self)
+        self._source_tabs = QTabWidget(self)
+        layout.addWidget(self._source_tabs)
+
+        btn_close = QPushButton("Close", self)
+        btn_close.clicked.connect(self.hide)
+        layout.addWidget(btn_close)
+
+        self.update_sections(sections=sections)
+
+    def update_sections(self, *, sections: List[EventDataSection]) -> None:
+        self._source_tabs.clear()
+        for section in sections:
+            widget = _EventDataSectionWidget(self._source_tabs, section=section)
+            self._source_tabs.addTab(widget, section.label)
 
 
 class BaseDataSource(ABC):
@@ -2165,6 +2187,9 @@ class BaseDataSource(ABC):
     def describe(self) -> str:
         return os.path.basename(self.filename)
 
+    def event_data_views(self, event: str) -> List[Tuple[str, str, "BaseDataSource", str]]:
+        return [(os.path.basename(self.filename), self.filename, self, event)]
+
     def supports_structure_viewer(self) -> bool:
         return False
 
@@ -2201,6 +2226,42 @@ class HDF5DataSource(BaseDataSource):
             return sorted(events, key=lambda token: int(str(token)))
         except Exception:
             return sorted(events)
+
+    def get_epoch_seconds(self, event: str) -> Optional[float]:
+        for dataset_name in (
+            "Metadata/unpacked/utc_timestamp_instrument",
+            "Metadata/utc_timestamp_instrument",
+        ):
+            values = self._read_dataset(event, dataset_name)
+            if values is None:
+                continue
+            try:
+                text_value: Any = np.asarray(values).reshape(-1)[0]
+            except Exception:
+                text_value = values
+            text = _coerce_optional_str(text_value)
+            if not text:
+                continue
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                continue
+
+        reference_seconds = SUMMARY_EPOCH_REFERENCE.timestamp()
+        for dataset_name in (
+            "Metadata/unpacked/epoch",
+            "Metadata/epoch",
+            "Metadata/unpacked/Epoch",
+            "Metadata/Epoch",
+        ):
+            values = self._read_dataset(event, dataset_name)
+            if values is None:
+                continue
+            epoch_seconds = _first_finite_scalar(values)
+            if epoch_seconds is None:
+                continue
+            return reference_seconds + float(epoch_seconds)
+        return None
 
     def _read_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
         path = f"/{event}/{dataset_name}"
@@ -3459,11 +3520,30 @@ class PairedCDFDataSource(BaseDataSource):
             f"[fits: {os.path.basename(self.fit_filename)}]"
         )
 
+    def event_data_views(self, event: str) -> List[Tuple[str, str, BaseDataSource, str]]:
+        return [
+            (str(self._waveform_source._product_level or "primary").upper(), self._waveform_source.filename, self._waveform_source, event),
+            (
+                str(self._fit_source._product_level or "secondary").upper(),
+                self._fit_source.filename,
+                self._fit_source,
+                self._fit_event(event),
+            ),
+        ]
+
     def supports_structure_viewer(self) -> bool:
-        return self._waveform_source.supports_structure_viewer()
+        return launch_multi_cdf_viewer is not None
 
     def launch_structure_viewer(self, parent: QWidget | None = None) -> QWidget:
-        return self._waveform_source.launch_structure_viewer(parent=parent)
+        if launch_multi_cdf_viewer is None:
+            raise RuntimeError("CDF viewer is not available. Install optional GUI components.")
+        return launch_multi_cdf_viewer(
+            [
+                (str(self._waveform_source._product_level or "primary").upper(), self._waveform_source.filename),
+                (str(self._fit_source._product_level or "secondary").upper(), self._fit_source.filename),
+            ],
+            parent=parent,
+        )
 
 
 class TRCDataSource(BaseDataSource):
@@ -3830,16 +3910,25 @@ _TRIGGER_LEVEL_DATASETS_BY_CHANNEL: Dict[str, Tuple[str, ...]] = {
         "Metadata/HGTriggerLevel",
         "Metadata/unpacked/HGTriggerLevel",
         "Analysis/HGTriggerLevel",
+        "Metadata/unpacked/IDX__TXHDRHGTRIGCTRL1",
+        "Metadata/packed/IDX__TXHDRHGTRIGCTRL1",
+        "Metadata/raw/IDX__TXHDRHGTRIGCTRL1",
     ),
     "TOF M": (
         "Metadata/MGTriggerLevel",
         "Metadata/unpacked/MGTriggerLevel",
         "Analysis/MGTriggerLevel",
+        "Metadata/unpacked/IDX__TXHDRMGTRIGCTRL1",
+        "Metadata/packed/IDX__TXHDRMGTRIGCTRL1",
+        "Metadata/raw/IDX__TXHDRMGTRIGCTRL1",
     ),
     "TOF L": (
         "Metadata/LGTriggerLevel",
         "Metadata/unpacked/LGTriggerLevel",
         "Analysis/LGTriggerLevel",
+        "Metadata/unpacked/IDX__TXHDRLGTRIGCTRL1",
+        "Metadata/packed/IDX__TXHDRLGTRIGCTRL1",
+        "Metadata/raw/IDX__TXHDRLGTRIGCTRL1",
     ),
     "Ion Grid": (
         "Metadata/LSTriggerLevel",
@@ -3863,31 +3952,49 @@ _TRIGGER_MODE_DATASETS_BY_CHANNEL: Dict[str, Tuple[str, ...]] = {
         "Metadata/HGTriggerMode",
         "Metadata/unpacked/HGTriggerMode",
         "Analysis/HGTriggerMode",
+        "Metadata/unpacked/IDX__TXHDRHGTRIGMODE",
+        "Metadata/packed/IDX__TXHDRHGTRIGMODE",
+        "Metadata/raw/IDX__TXHDRHGTRIGMODE",
     ),
     "TOF M": (
         "Metadata/MGTriggerMode",
         "Metadata/unpacked/MGTriggerMode",
         "Analysis/MGTriggerMode",
+        "Metadata/unpacked/IDX__TXHDRMGTRIGMODE",
+        "Metadata/packed/IDX__TXHDRMGTRIGMODE",
+        "Metadata/raw/IDX__TXHDRMGTRIGMODE",
     ),
     "TOF L": (
         "Metadata/LGTriggerMode",
         "Metadata/unpacked/LGTriggerMode",
         "Analysis/LGTriggerMode",
+        "Metadata/unpacked/IDX__TXHDRLGTRIGMODE",
+        "Metadata/packed/IDX__TXHDRLGTRIGMODE",
+        "Metadata/raw/IDX__TXHDRLGTRIGMODE",
     ),
     "Ion Grid": (
         "Metadata/LSTriggerMode",
         "Metadata/unpacked/LSTriggerMode",
         "Analysis/LSTriggerMode",
+        "Metadata/unpacked/IDX__TXHDRLSTRIGMODE",
+        "Metadata/packed/IDX__TXHDRLSTRIGMODE",
+        "Metadata/raw/IDX__TXHDRLSTRIGMODE",
     ),
     "Target L": (
         "Metadata/LSTriggerMode",
         "Metadata/unpacked/LSTriggerMode",
         "Analysis/LSTriggerMode",
+        "Metadata/unpacked/IDX__TXHDRLSTRIGMODE",
+        "Metadata/packed/IDX__TXHDRLSTRIGMODE",
+        "Metadata/raw/IDX__TXHDRLSTRIGMODE",
     ),
     "Target H": (
         "Metadata/LSTriggerMode",
         "Metadata/unpacked/LSTriggerMode",
         "Analysis/LSTriggerMode",
+        "Metadata/unpacked/IDX__TXHDRLSTRIGMODE",
+        "Metadata/packed/IDX__TXHDRLSTRIGMODE",
+        "Metadata/raw/IDX__TXHDRLSTRIGMODE",
     ),
 }
 
@@ -3902,6 +4009,9 @@ _TRIGGER_MODE_DATASETS: Tuple[str, ...] = (
     "Metadata/unpacked/TriggerMode",
     "Metadata/unpacked/TriggerType",
 )
+
+_PULSER_HG_TRIGGER_LEVEL = 0.289
+_PULSER_HG_TRIGGER_LEVEL_TOLERANCE = 1.0e-6
 
 _PACKET_TIME_COARSE_DATASETS: Tuple[str, ...] = (
     "Metadata/SHCOARSE",
@@ -4152,10 +4262,6 @@ def _classify_event_signal_type(data_source: Optional[BaseDataSource], event: Op
     if data_source is None or not event:
         return None
 
-    filename = str(getattr(data_source, "filename", "") or "")
-    if Path(filename).suffix.lower() != ".cdf":
-        return None
-
     origins = _guess_trigger_origins(data_source, event)
     origin_tokens = [origin.strip().lower() for origin in origins if origin and str(origin).strip()]
     configured_channels = _guess_active_trigger_channels(data_source, event)
@@ -4167,7 +4273,7 @@ def _classify_event_signal_type(data_source: Optional[BaseDataSource], event: Op
         return "Noise"
     if has_software_trigger and configured_set <= {"TOF H"}:
         return "Noise"
-    if configured_set == {"TOF H"}:
+    if configured_set == {"TOF H"} and _matches_hg_pulser_profile(data_source, event):
         return "Pulsar"
     if len(configured_set) >= 2 or any(channel != "TOF H" for channel in configured_set):
         return "Science"
@@ -4180,6 +4286,17 @@ def _guess_trigger_mode(data_source: BaseDataSource, event: str) -> Optional[str
         if text:
             return text
     return None
+
+
+def _matches_hg_pulser_profile(data_source: BaseDataSource, event: str) -> bool:
+    trigger_mode = _guess_trigger_mode(data_source, event)
+    if str(trigger_mode).strip() != "HGThreshold":
+        return False
+
+    hg_level = _guess_trigger_level_for_channel(data_source, event, "TOF H")
+    if hg_level is None:
+        return False
+    return abs(float(hg_level) - _PULSER_HG_TRIGGER_LEVEL) <= _PULSER_HG_TRIGGER_LEVEL_TOLERANCE
 
 
 def _trigger_channel_from_mode(trigger_mode: Optional[str]) -> Optional[str]:
@@ -7293,28 +7410,34 @@ class MainWindow(QMainWindow):
         self,
         event_name: str,
         *,
+        data_source: BaseDataSource,
+        filename: str,
+        source_event_name: Optional[str] = None,
         global_attributes: Dict[str, Any],
         event_attributes: List[Tuple[str, str, Any]],
         event_metadata: List[Tuple[str, Any, str]],
     ) -> str:
+        query_event_name = source_event_name or event_name
         lines = [
-            f"File: {self._filename or ''}",
-            f"Source: {self._data_source.describe() if self._data_source is not None else ''}",
+            f"File: {filename}",
+            f"Source: {data_source.describe()}",
             f"Event: {event_name}",
         ]
+        if source_event_name and source_event_name != event_name:
+            lines.append(f"Mapped Event: {source_event_name}")
 
-        aid = _get_event_aid(self._data_source, event_name)
+        aid = _get_event_aid(data_source, query_event_name)
         if aid is not None:
             lines.append(f"AID: {aid}")
 
-        packet_time = _guess_packet_time_seconds(self._data_source, event_name) if self._data_source else None
+        packet_time = _guess_packet_time_seconds(data_source, query_event_name)
         if packet_time is not None:
             lines.append(f"Packet Time: {packet_time:.6f}")
-            packet_time_utc = _packet_time_utc_text(self._data_source, event_name)
+            packet_time_utc = _packet_time_utc_text(data_source, query_event_name)
             if packet_time_utc is not None:
                 lines.append(f"Packet Time Approx. UTC: {packet_time_utc}")
 
-        timestamp_ms = _guess_event_timestamp_ms(self._data_source, event_name) if self._data_source else None
+        timestamp_ms = _guess_event_timestamp_ms(data_source, query_event_name)
         if timestamp_ms is not None:
             try:
                 utc_text = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).isoformat()
@@ -7327,6 +7450,35 @@ class MainWindow(QMainWindow):
         lines.append(f"Event Variables: {len(event_metadata)}")
         return "\n".join(lines)
 
+    def _build_event_data_sections(self, event_name: str) -> List[EventDataSection]:
+        if self._data_source is None:
+            return []
+
+        sections: List[EventDataSection] = []
+        for label, filename, data_source, source_event_name in self._data_source.event_data_views(event_name):
+            global_attributes = data_source.get_global_attributes()
+            event_attributes = data_source.event_attribute_rows(source_event_name)
+            event_metadata = data_source.event_metadata_rows(source_event_name)
+            summary_text = self._build_event_data_summary(
+                event_name,
+                data_source=data_source,
+                filename=filename,
+                source_event_name=source_event_name,
+                global_attributes=global_attributes,
+                event_attributes=event_attributes,
+                event_metadata=event_metadata,
+            )
+            sections.append(
+                EventDataSection(
+                    label=label,
+                    summary_text=summary_text,
+                    global_attributes=global_attributes,
+                    event_attributes=event_attributes,
+                    event_metadata=event_metadata,
+                )
+            )
+        return sections
+
     def _refresh_event_data_dialog(self) -> None:
         if (
             self._event_data_dialog is None
@@ -7335,23 +7487,10 @@ class MainWindow(QMainWindow):
         ):
             return
 
-        global_attributes = self._data_source.get_global_attributes()
-        event_attributes = self._data_source.event_attribute_rows(self._current_event)
-        event_metadata = self._data_source.event_metadata_rows(self._current_event)
-        summary_text = self._build_event_data_summary(
-            self._current_event,
-            global_attributes=global_attributes,
-            event_attributes=event_attributes,
-            event_metadata=event_metadata,
-        )
+        sections = self._build_event_data_sections(self._current_event)
 
         self._event_data_dialog.setWindowTitle(f"Event Data - Event {self._current_event}")
-        self._event_data_dialog.update_contents(
-            summary_text=summary_text,
-            global_attributes=global_attributes,
-            event_attributes=event_attributes,
-            event_metadata=event_metadata,
-        )
+        self._event_data_dialog.update_sections(sections=sections)
 
     def _close_event_data_dialog(self) -> None:
         if self._event_data_dialog is None:
@@ -7380,10 +7519,7 @@ class MainWindow(QMainWindow):
         if self._event_data_dialog is None:
             self._event_data_dialog = EventDataDialog(
                 self,
-                summary_text="",
-                global_attributes={},
-                event_attributes=[],
-                event_metadata=[],
+                sections=[],
             )
             self._event_data_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
