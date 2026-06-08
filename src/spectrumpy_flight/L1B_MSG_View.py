@@ -75,9 +75,15 @@ from matplotlib.dates import AutoDateLocator, ConciseDateFormatter, DateFormatte
 from matplotlib.figure import Figure
 
 
-FILE_GLOB = "imap_idex_l1b_msg_*.cdf"
+FILE_GLOBS = (
+    "imap_idex_l1b_msg_*.cdf",
+    "imap_idex_l1b_msg-*.cdf",
+)
 DEFAULT_DIRECTORY = Path(__file__).resolve().parent / "CDF" / "l1b_msg"
-SCIENCE_FILE_GLOB = "imap_idex_l1b_sci-1week_*.cdf"
+SCIENCE_FILE_GLOBS = (
+    "imap_idex_l1b_sci-1week_*.cdf",
+    "imap_idex_l1b_sci-10days_*.cdf",
+)
 DEFAULT_SCIENCE_DIRECTORY = Path(__file__).resolve().parent / "CDF" / "l1b"
 
 
@@ -262,6 +268,14 @@ def _read_vector(cdf: Any, varname: str) -> np.ndarray:
     except Exception:
         return np.asarray([])
     return data.reshape(-1)
+
+
+def _iter_matching_files(directory: Path, patterns: Sequence[str]) -> List[Path]:
+    matches: dict[Path, None] = {}
+    for pattern in patterns:
+        for path in sorted(directory.glob(pattern)):
+            matches[path] = None
+    return sorted(matches)
 
 
 def _fallback_epoch_seconds(value: Any) -> Optional[float]:
@@ -567,7 +581,7 @@ class L1BMsgViewWindow(QMainWindow):
         self._pulsar_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self._pulsar_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._pulsar_table.itemSelectionChanged.connect(self._on_pulsar_selection_changed)
-        self._left_tabs.addTab(self._pulsar_table, "Pulsar")
+        self._left_tabs.addTab(self._pulsar_table, "Pulser")
 
         self._flags_table = QTableWidget(self._left_tabs)
         self._flags_table.setColumnCount(len(self.FLAG_HEADERS))
@@ -683,7 +697,7 @@ class L1BMsgViewWindow(QMainWindow):
 
         records: List[L1BMsgRecord] = []
         failures: List[str] = []
-        for path in sorted(self._directory.glob(FILE_GLOB)):
+        for path in _iter_matching_files(self._directory, FILE_GLOBS):
             try:
                 records.append(_load_l1b_msg_record(path))
             except Exception as exc:
@@ -860,9 +874,20 @@ class L1BMsgViewWindow(QMainWindow):
             )
         return intervals
 
+    def _science_directory(self) -> Path:
+        if self._directory.name == "msg":
+            sibling = self._directory.parent / "sci"
+            if sibling.exists():
+                return sibling
+        sibling = self._directory / "sci"
+        if sibling.exists():
+            return sibling
+        return DEFAULT_SCIENCE_DIRECTORY
+
     def _load_science_event_rows(self) -> List[L1BScienceEventRow]:
         rows: List[L1BScienceEventRow] = []
-        for path in sorted(DEFAULT_SCIENCE_DIRECTORY.glob(SCIENCE_FILE_GLOB)):
+        science_directory = self._science_directory()
+        for path in _iter_matching_files(science_directory, SCIENCE_FILE_GLOBS):
             try:
                 cdf = cdflib.CDF(str(path))
                 epoch_values = _read_vector(cdf, "epoch")
@@ -988,7 +1013,7 @@ class L1BMsgViewWindow(QMainWindow):
                         epoch_dt=first.epoch_dt,
                         category="pulsar",
                         condition=(
-                            f"Pulsar sequence contains {cycle_count} on/off cycles; "
+                            f"Pulser sequence contains {cycle_count} on/off cycles; "
                             f"expected {self.PULSAR_EXPECTED_CYCLES}."
                         ),
                         filename=first.filename,
@@ -1010,7 +1035,7 @@ class L1BMsgViewWindow(QMainWindow):
                             epoch_dt=current_start.epoch_dt,
                             category="pulsar",
                             condition=(
-                                "Pulsar sequence gap was "
+                                "Pulser sequence gap was "
                                 f"{self._format_duration(spacing)}; expected roughly 8 days and no more than 9 days."
                             ),
                             filename=current_start.filename,
@@ -1059,7 +1084,7 @@ class L1BMsgViewWindow(QMainWindow):
                     epoch_dt=interval.start_dt,
                     category="pulsar",
                     condition=(
-                        f"Pulsar on period from {interval.start} to {interval.end} "
+                        f"Pulser on period from {interval.start} to {interval.end} "
                         f"contained {event_count} science events; expected exactly 1."
                     ),
                     filename=interval.filename,
@@ -1202,7 +1227,7 @@ class L1BMsgViewWindow(QMainWindow):
         for interval in self._pulsar_intervals:
             if interval.start_dt is None or interval.end_dt is None or interval.end_dt < interval.start_dt:
                 continue
-            label = "Pulsar On"
+            label = "Pulser On"
             ax.axvspan(
                 interval.start_dt,
                 interval.end_dt,

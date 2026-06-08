@@ -65,8 +65,11 @@ except Exception:  # pragma: no cover - import guard
     _QT_API = "PyQt6"
 
 
-FILE_GLOB = "imap_idex_l1a_msg_*.cdf"
+FILE_PREFIX = "imap_idex_l1a_msg"
 DEFAULT_DIRECTORY = Path(__file__).resolve().parent / "CDF" / "l1a_msg"
+
+SHCOARSE_CANDIDATES = ("shcoarse", "elsec_evtpkt")
+SHFINE_CANDIDATES = ("shfine", "elssec_evtpkt")
 
 
 def _stringify_value(value: Any) -> str:
@@ -221,6 +224,14 @@ def _read_vector(cdf: Any, varname: str) -> np.ndarray:
     return data.reshape(-1)
 
 
+def _read_first_available_vector(cdf: Any, candidates: Sequence[str]) -> np.ndarray:
+    for varname in candidates:
+        data = _read_vector(cdf, varname)
+        if data.size:
+            return data
+    return np.asarray([])
+
+
 @dataclass(frozen=True)
 class L1AMsgTableRow:
     epoch: str
@@ -281,8 +292,8 @@ def _load_l1a_msg_record(path: Path) -> L1AMsgRecord:
 
     global_attributes = _normalize_attr_mapping(cdf.globalattsget())
     epoch_values = _read_vector(cdf, "epoch")
-    shcoarse_values = _read_vector(cdf, "shcoarse")
-    shfine_values = _read_vector(cdf, "shfine")
+    shcoarse_values = _read_first_available_vector(cdf, SHCOARSE_CANDIDATES)
+    shfine_values = _read_first_available_vector(cdf, SHFINE_CANDIDATES)
     messages_values = _read_vector(cdf, "messages")
     epoch_texts = _epoch_vector_to_iso(epoch_values)
 
@@ -473,7 +484,13 @@ class L1AMsgViewWindow(QMainWindow):
 
         records: List[L1AMsgRecord] = []
         failures: List[str] = []
-        for path in sorted(self._directory.glob(FILE_GLOB)):
+        for path in sorted(
+            item
+            for item in self._directory.iterdir()
+            if item.is_file()
+            and item.suffix.lower() == ".cdf"
+            and item.name.startswith(FILE_PREFIX)
+        ):
             try:
                 records.append(_load_l1a_msg_record(path))
             except Exception as exc:

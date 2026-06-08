@@ -329,6 +329,51 @@ def prompt_for_cdf_pair(parent: QWidget) -> Optional[Tuple[str, str]]:
 
     return str(primary_path), str(secondary_path)
 
+
+def prompt_for_cdf_directory(
+    parent: QWidget,
+    start_dir: str | None = None,
+) -> Optional[str]:
+    """Prompt for a directory containing like-type CDF products."""
+
+    if start_dir is None:
+        repo_root = Path(__file__).resolve().parent
+        cdf_dir = repo_root / "CDF"
+        start_dir = str(cdf_dir if cdf_dir.exists() else repo_root)
+
+    directory = QFileDialog.getExistingDirectory(
+        parent,
+        "Open CDF Directory",
+        start_dir,
+        QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog,
+    )
+    return directory or None
+
+
+def prompt_for_cdf_directory_pair(parent: QWidget) -> Optional[Tuple[str, str]]:
+    """Prompt for an explicit pair of L1B/L2A CDF directories."""
+
+    primary = prompt_for_cdf_directory(parent)
+    if not primary:
+        return None
+
+    primary_path = Path(primary).expanduser().resolve()
+    secondary_start_dir = str(primary_path.parent)
+    secondary = prompt_for_cdf_directory(parent, start_dir=secondary_start_dir)
+    if not secondary:
+        return None
+
+    secondary_path = Path(secondary).expanduser().resolve()
+    if secondary_path == primary_path:
+        QMessageBox.warning(
+            parent,
+            "Invalid Pair",
+            "Choose two different directories when opening a custom L1B/L2A directory pair.",
+        )
+        return None
+
+    return str(primary_path), str(secondary_path)
+
 def _normalize_name(value: str) -> str:
     return "".join(ch.lower() for ch in value if ch.isalnum())
 
@@ -1796,7 +1841,7 @@ def _idex_ion_grid_model(x: np.ndarray, *params: float) -> np.ndarray:
     return np.zeros_like(arr, dtype=float)
 
 
-def _emg_model(x: np.ndarray, mu: float, sigma: float, lam: float) -> np.ndarray:
+def _emg_model(x: np.ndarray, amplitude: float, mu: float, sigma: float, lam: float) -> np.ndarray:
     arr = np.asarray(x, dtype=float)
     if arr.size == 0:
         return arr
@@ -1804,10 +1849,11 @@ def _emg_model(x: np.ndarray, mu: float, sigma: float, lam: float) -> np.ndarray
         return np.zeros_like(arr, dtype=float)
     safe_sigma = sigma if abs(sigma) > 1.0e-15 else 1.0e-15
     safe_lambda = lam
+    safe_amplitude = max(float(amplitude), 0.0)
     with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
         exponent = np.exp((safe_lambda / 2.0) * (2.0 * mu + safe_lambda * safe_sigma**2 - 2.0 * arr))
     argument = (mu + safe_lambda * safe_sigma**2 - arr) / (np.sqrt(2.0) * safe_sigma)
-    return (safe_lambda / 2.0) * exponent * _erfc(argument)
+    return safe_amplitude * (safe_lambda / 2.0) * exponent * _erfc(argument)
 
 
 ION_GRID_FIT = FitModelMeta(
@@ -1822,12 +1868,13 @@ ION_GRID_FIT = FitModelMeta(
 
 EMG_FIT = FitModelMeta(
     parameter_labels=(
+        "Amplitude",
         "μ (location)",
         "σ (width)",
         "λ (decay)",
     ),
     latex=(
-        r"f(t) = \frac{\lambda}{2} \exp\left[\frac{\lambda}{2}(2\mu + \lambda\sigma^2 - 2t)\right]"
+        r"f(t) = A\,\frac{\lambda}{2} \exp\left[\frac{\lambda}{2}(2\mu + \lambda\sigma^2 - 2t)\right]"
         r" \mathrm{erfc}\left(\frac{\mu + \lambda\sigma^2 - t}{\sqrt{2}\,\sigma}\right)"
     ),
     evaluator=_emg_model,
@@ -2189,6 +2236,9 @@ class BaseDataSource(ABC):
 
     def event_data_views(self, event: str) -> List[Tuple[str, str, "BaseDataSource", str]]:
         return [(os.path.basename(self.filename), self.filename, self, event)]
+
+    def format_event_label(self, event: str) -> Optional[str]:
+        return None
 
     def supports_structure_viewer(self) -> bool:
         return False
@@ -2632,6 +2682,7 @@ class CDFDataSource(BaseDataSource):
         "TOF H Peak Reduced Chi Squared": ("tof_peak_reduced_chi_square", "direct"),
         "TOF H Peak Kappa": ("tof_peak_kappa", "direct"),
         "TOF H SNR": ("tof_snr", "direct"),
+        "TOF H Fit Baseline": ("tof_fit_baseline", "direct"),
     }
 
     #: Fit metadata required for quicklook overlays.
@@ -2710,7 +2761,11 @@ class CDFDataSource(BaseDataSource):
         return None
 
     def _trigger_thresholds_compatible(self) -> bool:
-        return self._product_level != "l1a"
+        # L1A CDFs do not publish the decoded trigger-level products that L1B/HDF5
+        # carry, but they do retain the raw TXHDR trigger control registers.
+        # Reuse the same raw-register scaling so signal classification can run on
+        # L1A events without a separate code path.
+        return True
 
     def _resolve_event_count(self) -> int:
         try:
@@ -3227,8 +3282,19 @@ class CDFDataSource(BaseDataSource):
         if params_var:
             params_data = self._cached_variable(params_var)
             if params_data.size and index < params_data.shape[0]:
-                params_key = f"{event_prefix}/{channel} Fit Parameters"
-                data.parameter_series[params_key] = np.array(params_data[index], copy=True)
+                event_params = np.array(params_data[index], copy=True)
+                if channel == "TOF H" and event_params.ndim >= 2:
+                    for mass_idx, row in enumerate(event_params):
+                        row = np.asarray(row, dtype=float)
+                        if not np.any(np.isfinite(row) & (row != 0)):
+                            continue
+                        params_key = (
+                            f"{event_prefix}/{channel} Peak {mass_idx:03d} Parameters"
+                        )
+                        data.parameter_series[params_key] = row
+                else:
+                    params_key = f"{event_prefix}/{channel} Fit Parameters"
+                    data.parameter_series[params_key] = event_params
 
         return data
 
@@ -3257,6 +3323,17 @@ def _cdf_pairing_key(path: Path) -> Optional[Tuple[str, str]]:
     return match.group("product"), match.group("date")
 
 
+def _cdf_directory_group_key(path: Path) -> Optional[Tuple[str, str, str]]:
+    stem = path.stem.lower()
+    match = re.match(
+        r"(?P<prefix>imap_idex_)(?P<level>l[12][ab])_(?P<product>.+?)_(?P<date>\d{8})_v\d+$",
+        stem,
+    )
+    if not match:
+        return None
+    return match.group("level"), match.group("product"), match.group("date")
+
+
 def _cdf_version(path: Path) -> int:
     match = re.search(r"_v(\d+)$", path.stem.lower())
     if not match:
@@ -3265,6 +3342,46 @@ def _cdf_version(path: Path) -> int:
         return int(match.group(1))
     except Exception:
         return -1
+
+
+def _select_latest_cdf_versions(directory: Path) -> List[Path]:
+    """Return one CDF per product/date, keeping the newest version."""
+
+    selected: Dict[Tuple[str, str, str], Path] = {}
+    unmatched: List[Path] = []
+
+    for path in sorted(directory.glob("*.cdf")):
+        group_key = _cdf_directory_group_key(path)
+        if group_key is None:
+            unmatched.append(path)
+            continue
+        current = selected.get(group_key)
+        if current is None or (_cdf_version(path), path.name) > (_cdf_version(current), current.name):
+            selected[group_key] = path
+
+    return sorted(
+        list(selected.values()) + unmatched,
+        key=lambda item: (
+            _cdf_directory_group_key(item)[2] if _cdf_directory_group_key(item) is not None else item.stem.lower(),
+            _cdf_directory_group_key(item)[1] if _cdf_directory_group_key(item) is not None else item.stem.lower(),
+            _cdf_directory_group_key(item)[0] if _cdf_directory_group_key(item) is not None else item.stem.lower(),
+            _cdf_version(item),
+            item.name.lower(),
+        ),
+    )
+
+
+def _detect_cdf_directory_level(directory: Path) -> Optional[str]:
+    counts: Dict[str, int] = {}
+    for path in _select_latest_cdf_versions(directory):
+        group_key = _cdf_directory_group_key(path)
+        if group_key is None:
+            continue
+        level = group_key[0]
+        counts[level] = counts.get(level, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
 
 
 def _find_paired_cdf_path(filename: str) -> Optional[Path]:
@@ -3546,6 +3663,422 @@ class PairedCDFDataSource(BaseDataSource):
         )
 
 
+class CDFDirectoryDataSource(BaseDataSource):
+    """Aggregate a directory of same-type CDF products into one datasource."""
+
+    EVENT_DELIMITER = "::"
+
+    def __init__(self, directory: str):
+        directory_path = Path(directory).expanduser().resolve()
+        if not directory_path.is_dir():
+            raise FileNotFoundError(f"CDF directory not found: {directory_path}")
+
+        selected_files = _select_latest_cdf_versions(directory_path)
+        if not selected_files:
+            raise FileNotFoundError(f"No .cdf files were found in {directory_path}")
+
+        super().__init__(str(directory_path))
+        self._directory = directory_path
+        self._selected_files = selected_files
+        self._sources: Dict[str, BaseDataSource] = {}
+        self._event_map: Dict[str, Tuple[str, str]] = {}
+        self._ordered_events: List[str] = []
+        self._display_labels: Dict[str, str] = {}
+
+        try:
+            for path in self._selected_files:
+                self._sources[str(path)] = create_data_source(str(path))
+            self._build_event_index()
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        for source in self._sources.values():
+            try:
+                source.close()
+            except Exception:
+                pass
+
+    def _build_event_index(self) -> None:
+        entries: List[Tuple[Tuple[int, float, str, int], str, str, str]] = []
+        for path in self._selected_files:
+            source = self._sources[str(path)]
+            for event_name in source.list_events():
+                event_id = f"{path.name}{self.EVENT_DELIMITER}{event_name}"
+                self._event_map[event_id] = (str(path), event_name)
+                self._display_labels[event_id] = f"{path.stem} / Event {event_name}"
+
+                epoch_seconds = None
+                packet_seconds = None
+                try:
+                    epoch_seconds = source.get_epoch_seconds(event_name)  # type: ignore[attr-defined]
+                except Exception:
+                    epoch_seconds = None
+                try:
+                    packet_seconds = source.get_packet_time_seconds(event_name)
+                except Exception:
+                    packet_seconds = None
+
+                timestamp = epoch_seconds if epoch_seconds is not None else packet_seconds
+                if timestamp is not None:
+                    try:
+                        timestamp = float(timestamp)
+                    except Exception:
+                        timestamp = None
+                sort_key = (
+                    0 if timestamp is not None and np.isfinite(timestamp) else 1,
+                    float(timestamp) if timestamp is not None and np.isfinite(timestamp) else float("inf"),
+                    path.name.lower(),
+                    self._event_sort_index(event_name),
+                )
+                entries.append((sort_key, event_id, str(path), event_name))
+
+        entries.sort(key=lambda item: item[0])
+        self._ordered_events = [event_id for _sort_key, event_id, _path, _event in entries]
+
+    @staticmethod
+    def _event_sort_index(event_name: str) -> int:
+        try:
+            return int(str(event_name))
+        except Exception:
+            return 0
+
+    def _resolve_event(self, event: str) -> Tuple[BaseDataSource, str, str]:
+        path, source_event = self._event_map[event]
+        return self._sources[path], path, source_event
+
+    def list_events(self) -> List[str]:
+        return list(self._ordered_events)
+
+    def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
+        source, _path, source_event = self._resolve_event(event)
+        return source.get_dataset(source_event, dataset_name)
+
+    def get_dataset_attributes(self, event: str, dataset_name: str) -> Dict[str, Any]:
+        source, _path, source_event = self._resolve_event(event)
+        return source.get_dataset_attributes(source_event, dataset_name)
+
+    def gather_fit_data(self, event: str, channel: str) -> FitData:
+        source, _path, source_event = self._resolve_event(event)
+        return source.gather_fit_data(source_event, channel)
+
+    def channel_definitions(self) -> Dict[str, ChannelDefinition]:
+        if not self._selected_files:
+            return dict(CHANNEL_DEFS)
+        return self._sources[str(self._selected_files[0])].channel_definitions()
+
+    def channel_order(self) -> List[str]:
+        if not self._selected_files:
+            return list(CHANNEL_ORDER)
+        return self._sources[str(self._selected_files[0])].channel_order()
+
+    def get_group_attributes(self, event: str, group_path: str) -> Dict[str, Any]:
+        source, _path, source_event = self._resolve_event(event)
+        return source.get_group_attributes(source_event, group_path)
+
+    def get_event_attributes(self, event: str) -> Dict[str, Any]:
+        source, path, source_event = self._resolve_event(event)
+        attrs = dict(source.get_event_attributes(source_event))
+        attrs.setdefault("source_file", os.path.basename(path))
+        return attrs
+
+    def get_global_attributes(self) -> Dict[str, Any]:
+        attrs: Dict[str, Any] = {
+            "source_directory": str(self._directory),
+            "selected_cdf_files": [path.name for path in self._selected_files],
+        }
+        if self._selected_files:
+            first_source = self._sources[str(self._selected_files[0])]
+            for key, value in first_source.get_global_attributes().items():
+                attrs.setdefault(key, value)
+        return attrs
+
+    def event_attribute_rows(self, event: str) -> List[Tuple[str, str, Any]]:
+        source, path, source_event = self._resolve_event(event)
+        rows = list(source.event_attribute_rows(source_event))
+        rows.insert(0, (".", "source_file", os.path.basename(path)))
+        return rows
+
+    def event_metadata_rows(self, event: str) -> List[Tuple[str, Any, str]]:
+        source, path, source_event = self._resolve_event(event)
+        rows = list(source.event_metadata_rows(source_event))
+        rows.insert(0, ("source_file", os.path.basename(path), "Scalar"))
+        return rows
+
+    def list_analysis_datasets(self) -> List[str]:
+        if not self._selected_files:
+            return []
+        return self._sources[str(self._selected_files[0])].list_analysis_datasets()
+
+    def get_packet_time_seconds(self, event: str) -> Optional[float]:
+        source, _path, source_event = self._resolve_event(event)
+        return source.get_packet_time_seconds(source_event)
+
+    def get_epoch_seconds(self, event: str) -> Optional[float]:
+        source, _path, source_event = self._resolve_event(event)
+        getter = getattr(source, "get_epoch_seconds", None)
+        if getter is None:
+            return None
+        return getter(source_event)
+
+    def describe(self) -> str:
+        return (
+            f"CDF Directory: {self._directory.name} "
+            f"({len(self._selected_files)} newest-version file{'s' if len(self._selected_files) != 1 else ''})"
+        )
+
+    def event_data_views(self, event: str) -> List[Tuple[str, str, BaseDataSource, str]]:
+        source, path, source_event = self._resolve_event(event)
+        return source.event_data_views(source_event)
+
+    def supports_structure_viewer(self) -> bool:
+        return False
+
+    def format_event_label(self, event: str) -> Optional[str]:
+        return self._display_labels.get(event)
+
+
+class PairedCDFDirectoryDataSource(BaseDataSource):
+    """Aggregate matched L1B/L2A CDF directories into one paired datasource."""
+
+    EVENT_DELIMITER = "::"
+
+    def __init__(self, primary_directory: str, paired_directory: str):
+        primary_path = Path(primary_directory).expanduser().resolve()
+        paired_path = Path(paired_directory).expanduser().resolve()
+        if not primary_path.is_dir():
+            raise FileNotFoundError(f"CDF directory not found: {primary_path}")
+        if not paired_path.is_dir():
+            raise FileNotFoundError(f"CDF directory not found: {paired_path}")
+
+        primary_level = _detect_cdf_directory_level(primary_path)
+        secondary_level = _detect_cdf_directory_level(paired_path)
+        if {primary_level, secondary_level} != {"l1b", "l2a"}:
+            raise ValueError(
+                "Choose one L1B CDF directory and one L2A CDF directory for paired loading."
+            )
+
+        if primary_level == "l1b":
+            waveform_directory = primary_path
+            fit_directory = paired_path
+        else:
+            waveform_directory = paired_path
+            fit_directory = primary_path
+
+        waveform_files = _select_latest_cdf_versions(waveform_directory)
+        fit_files = _select_latest_cdf_versions(fit_directory)
+        if not waveform_files:
+            raise FileNotFoundError(f"No .cdf files were found in {waveform_directory}")
+        if not fit_files:
+            raise FileNotFoundError(f"No .cdf files were found in {fit_directory}")
+
+        super().__init__(str(waveform_directory))
+        self._waveform_directory = waveform_directory
+        self._fit_directory = fit_directory
+        self._selected_waveform_files = waveform_files
+        self._selected_fit_files = fit_files
+        self._sources: Dict[str, BaseDataSource] = {}
+        self._event_map: Dict[str, Tuple[str, str]] = {}
+        self._ordered_events: List[str] = []
+        self._display_labels: Dict[str, str] = {}
+        self._paired_files: Dict[str, str] = {}
+
+        fit_by_key: Dict[Tuple[str, str], Path] = {}
+        for fit_path in fit_files:
+            key = _cdf_pairing_key(fit_path)
+            if key is not None:
+                fit_by_key[key] = fit_path
+
+        try:
+            for waveform_path in waveform_files:
+                pairing_key = _cdf_pairing_key(waveform_path)
+                fit_path = fit_by_key.get(pairing_key) if pairing_key is not None else None
+                if fit_path is not None:
+                    self._sources[str(waveform_path)] = PairedCDFDataSource(
+                        str(waveform_path),
+                        str(fit_path),
+                    )
+                    self._paired_files[str(waveform_path)] = str(fit_path)
+                else:
+                    self._sources[str(waveform_path)] = CDFDataSource(str(waveform_path))
+                
+            self._build_event_index()
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        for source in self._sources.values():
+            try:
+                source.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _event_sort_index(event_name: str) -> int:
+        try:
+            return int(str(event_name))
+        except Exception:
+            return 0
+
+    def _build_event_index(self) -> None:
+        entries: List[Tuple[Tuple[int, float, str, int], str, str, str]] = []
+        for waveform_path in self._selected_waveform_files:
+            source = self._sources[str(waveform_path)]
+            paired_path = self._paired_files.get(str(waveform_path))
+            for event_name in source.list_events():
+                event_id = f"{waveform_path.name}{self.EVENT_DELIMITER}{event_name}"
+                self._event_map[event_id] = (str(waveform_path), event_name)
+                if paired_path is not None:
+                    fit_stem = Path(paired_path).stem
+                    self._display_labels[event_id] = (
+                        f"{waveform_path.stem} -> {fit_stem} / Event {event_name}"
+                    )
+                else:
+                    self._display_labels[event_id] = f"{waveform_path.stem} / Event {event_name}"
+
+                epoch_seconds = None
+                packet_seconds = None
+                try:
+                    epoch_seconds = source.get_epoch_seconds(event_name)
+                except Exception:
+                    epoch_seconds = None
+                try:
+                    packet_seconds = source.get_packet_time_seconds(event_name)
+                except Exception:
+                    packet_seconds = None
+
+                timestamp = epoch_seconds if epoch_seconds is not None else packet_seconds
+                if timestamp is not None:
+                    try:
+                        timestamp = float(timestamp)
+                    except Exception:
+                        timestamp = None
+                sort_key = (
+                    0 if timestamp is not None and np.isfinite(timestamp) else 1,
+                    float(timestamp) if timestamp is not None and np.isfinite(timestamp) else float("inf"),
+                    waveform_path.name.lower(),
+                    self._event_sort_index(event_name),
+                )
+                entries.append((sort_key, event_id, str(waveform_path), event_name))
+
+        entries.sort(key=lambda item: item[0])
+        self._ordered_events = [event_id for _sort_key, event_id, _path, _event in entries]
+
+    def _resolve_event(self, event: str) -> Tuple[BaseDataSource, str, str]:
+        path, source_event = self._event_map[event]
+        return self._sources[path], path, source_event
+
+    def list_events(self) -> List[str]:
+        return list(self._ordered_events)
+
+    def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
+        source, _path, source_event = self._resolve_event(event)
+        return source.get_dataset(source_event, dataset_name)
+
+    def get_dataset_attributes(self, event: str, dataset_name: str) -> Dict[str, Any]:
+        source, _path, source_event = self._resolve_event(event)
+        return source.get_dataset_attributes(source_event, dataset_name)
+
+    def gather_fit_data(self, event: str, channel: str) -> FitData:
+        source, _path, source_event = self._resolve_event(event)
+        return source.gather_fit_data(source_event, channel)
+
+    def channel_definitions(self) -> Dict[str, ChannelDefinition]:
+        if not self._selected_waveform_files:
+            return dict(CHANNEL_DEFS)
+        return self._sources[str(self._selected_waveform_files[0])].channel_definitions()
+
+    def channel_order(self) -> List[str]:
+        if not self._selected_waveform_files:
+            return list(CHANNEL_ORDER)
+        return self._sources[str(self._selected_waveform_files[0])].channel_order()
+
+    def get_group_attributes(self, event: str, group_path: str) -> Dict[str, Any]:
+        source, _path, source_event = self._resolve_event(event)
+        return source.get_group_attributes(source_event, group_path)
+
+    def get_event_attributes(self, event: str) -> Dict[str, Any]:
+        source, path, source_event = self._resolve_event(event)
+        attrs = dict(source.get_event_attributes(source_event))
+        attrs.setdefault("source_file", os.path.basename(path))
+        paired = self._paired_files.get(path)
+        if paired is not None:
+            attrs.setdefault("paired_fit_file", os.path.basename(paired))
+        return attrs
+
+    def get_global_attributes(self) -> Dict[str, Any]:
+        attrs: Dict[str, Any] = {
+            "waveform_directory": str(self._waveform_directory),
+            "fit_directory": str(self._fit_directory),
+            "selected_waveform_cdf_files": [path.name for path in self._selected_waveform_files],
+            "selected_fit_cdf_files": [path.name for path in self._selected_fit_files],
+        }
+        if self._selected_waveform_files:
+            first_source = self._sources[str(self._selected_waveform_files[0])]
+            for key, value in first_source.get_global_attributes().items():
+                attrs.setdefault(key, value)
+        return attrs
+
+    def event_attribute_rows(self, event: str) -> List[Tuple[str, str, Any]]:
+        source, path, source_event = self._resolve_event(event)
+        rows = list(source.event_attribute_rows(source_event))
+        rows.insert(0, (".", "source_file", os.path.basename(path)))
+        paired = self._paired_files.get(path)
+        if paired is not None:
+            rows.insert(1, (".", "paired_fit_file", os.path.basename(paired)))
+        return rows
+
+    def event_metadata_rows(self, event: str) -> List[Tuple[str, Any, str]]:
+        source, path, source_event = self._resolve_event(event)
+        rows = list(source.event_metadata_rows(source_event))
+        rows.insert(0, ("source_file", os.path.basename(path), "Scalar"))
+        paired = self._paired_files.get(path)
+        if paired is not None:
+            rows.insert(1, ("paired_fit_file", os.path.basename(paired), "Scalar"))
+        return rows
+
+    def list_analysis_datasets(self) -> List[str]:
+        if not self._selected_waveform_files:
+            return []
+        return self._sources[str(self._selected_waveform_files[0])].list_analysis_datasets()
+
+    def get_packet_time_seconds(self, event: str) -> Optional[float]:
+        source, _path, source_event = self._resolve_event(event)
+        return source.get_packet_time_seconds(source_event)
+
+    def get_epoch_seconds(self, event: str) -> Optional[float]:
+        source, _path, source_event = self._resolve_event(event)
+        getter = getattr(source, "get_epoch_seconds", None)
+        if getter is None:
+            return None
+        return getter(source_event)
+
+    def describe(self) -> str:
+        return (
+            f"CDF Dir Pair: {self._waveform_directory.name} [L1B] + {self._fit_directory.name} [L2A] "
+            f"({len(self._selected_waveform_files)} waveform file{'s' if len(self._selected_waveform_files) != 1 else ''})"
+        )
+
+    def event_data_views(self, event: str) -> List[Tuple[str, str, BaseDataSource, str]]:
+        source, _path, source_event = self._resolve_event(event)
+        return source.event_data_views(source_event)
+
+    def format_event_label(self, event: str) -> Optional[str]:
+        return self._display_labels.get(event)
+
+    def supports_structure_viewer(self) -> bool:
+        source = next(iter(self._sources.values()), None)
+        return bool(source is not None and source.supports_structure_viewer())
+
+    def launch_structure_viewer(self, parent: QWidget | None = None) -> QWidget:
+        source = next(iter(self._sources.values()), None)
+        if source is None:
+            raise RuntimeError("No paired CDF sources are available.")
+        return source.launch_structure_viewer(parent=parent)
+
+
 class TRCDataSource(BaseDataSource):
     """Adapter that exposes a directory of LeCroy ``.trc`` files as quicklook events."""
 
@@ -3734,7 +4267,14 @@ def create_data_source(filename: str, paired_filename: Optional[str] = None) -> 
     """Instantiate the appropriate data source for ``filename``."""
 
     path = Path(filename)
+    paired_path = Path(paired_filename).expanduser() if paired_filename is not None else None
     if path.is_dir():
+        if paired_path is not None and paired_path.is_dir():
+            return PairedCDFDirectoryDataSource(filename, str(paired_path))
+        if any(path.glob("*.trc")):
+            return TRCDataSource(filename)
+        if any(path.glob("*.cdf")):
+            return CDFDirectoryDataSource(filename)
         return TRCDataSource(filename)
 
     suffix = path.suffix.lower()
@@ -4274,7 +4814,7 @@ def _classify_event_signal_type(data_source: Optional[BaseDataSource], event: Op
     if has_software_trigger and configured_set <= {"TOF H"}:
         return "Noise"
     if configured_set == {"TOF H"} and _matches_hg_pulser_profile(data_source, event):
-        return "Pulsar"
+        return "Pulser"
     if len(configured_set) >= 2 or any(channel != "TOF H" for channel in configured_set):
         return "Science"
     return "Science"
@@ -5396,7 +5936,7 @@ class SQLMatchDialog(QDialog):
 
     def _current_selection(self) -> Optional[SQLMatchResult]:
         selected = self.matches_table.selectionModel()
-        if not selected:
+        if not selected and not show_mass_spectrum:
             return None
         indexes = selected.selectedRows()
         if not indexes:
@@ -5596,6 +6136,7 @@ class MainWindow(QMainWindow):
         self._stats_selectors: List[SpanSelector] = []
         self._stats_axes: List[Any] = []
         self._show_fit: Dict[str, bool] = {name: False for name in FIT_ELIGIBLE_CHANNELS}
+        self._show_mass_spectrum = False
         self._compact_plot_mode = True
         self._same_time_scale_mode = True
         self._current_axis_count = 1
@@ -5606,6 +6147,7 @@ class MainWindow(QMainWindow):
         # building the control panel) were leaving the attribute undefined which
         # caused an ``AttributeError`` when plotting the first event.
         self.fit_buttons: Dict[str, QPushButton] = {}
+        self.mass_spectrum_button: Optional[QPushButton] = None
         self._action_grid_buttons: Dict[str, QPushButton] = {}
         self.selected_channels = set(CHANNEL_ORDER)
         self._child_windows: List[QWidget] = []
@@ -5840,6 +6382,18 @@ class MainWindow(QMainWindow):
         self.open_cdf_action = QAction("Open CDF…", self)
         self.open_cdf_action.triggered.connect(lambda: self.action_open(preferred="cdf"))
 
+        self.open_cdf_directory_action = QAction("Open CDF Directory…", self)
+        self.open_cdf_directory_action.setStatusTip(
+            "Open a directory of like-type CDF files, keeping the newest version for each date",
+        )
+        self.open_cdf_directory_action.triggered.connect(self.action_open_cdf_directory)
+
+        self.open_cdf_directory_pair_action = QAction("Open CDF Dir Pair…", self)
+        self.open_cdf_directory_pair_action.setStatusTip(
+            "Open paired L1B and L2A CDF directories for waveform/fit overlays",
+        )
+        self.open_cdf_directory_pair_action.triggered.connect(self.action_open_cdf_directory_pair)
+
         self.open_cdf_pair_action = QAction("Open CDF Pair…", self)
         self.open_cdf_pair_action.setStatusTip(
             "Open a custom L1B/L2A CDF pairing for overlay comparisons",
@@ -5938,6 +6492,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.open_any_action)
         file_menu.addAction(self.open_hdf5_action)
         file_menu.addAction(self.open_cdf_action)
+        file_menu.addAction(self.open_cdf_directory_action)
+        file_menu.addAction(self.open_cdf_directory_pair_action)
         file_menu.addAction(self.open_cdf_pair_action)
         file_menu.addAction(self.open_trc_action)
         file_menu.addSeparator()
@@ -6067,6 +6623,8 @@ class MainWindow(QMainWindow):
         tb.addAction(self.open_any_action)
         tb.addAction(self.open_hdf5_action)
         tb.addAction(self.open_cdf_action)
+        tb.addAction(self.open_cdf_directory_action)
+        tb.addAction(self.open_cdf_directory_pair_action)
         tb.addAction(self.open_cdf_pair_action)
         tb.addSeparator()
         tb.addAction(self.reload_action)
@@ -6456,7 +7014,7 @@ class MainWindow(QMainWindow):
             # ("Open…", lambda: self.open_any_action.trigger(), "Open an HDF5 or CDF file"),
             # ("Open HDF5", lambda: self.open_hdf5_action.trigger(), "Open an HDF5 data file"),
             # ("Open CDF", lambda: self.open_cdf_action.trigger(), "Open a CDF data file"),
-            ("Open CDF Pair", self.action_open_cdf_pair, "Open a custom L1B/L2A CDF pairing"),
+            ("Open CDF Dir", self.action_open_cdf_directory, "Open a CDF directory and keep the newest version for each date"),
             # ("Reload", self.reload_current, "Reload the current file"),
             # ("Close File", lambda: self.close_file_action.trigger(), "Close the current data file"),
             # ("Save PNG", lambda: self.save_plot("png"), "Save the current plot as a PNG image"),
@@ -6540,6 +7098,18 @@ class MainWindow(QMainWindow):
         self.edit_params_button.clicked.connect(self.open_fit_parameter_dialog)
         fit_row_widgets.append(self.edit_params_button)
         control_buttons.append(self.edit_params_button)
+
+        self.mass_spectrum_button = QPushButton("Mass Spectrum", self)
+        self.mass_spectrum_button.setCheckable(True)
+        self.mass_spectrum_button.setMinimumHeight(0)
+        self.mass_spectrum_button.setStyleSheet(toggle_style)
+        self.mass_spectrum_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.mass_spectrum_button.setToolTip(
+            "Show a TOF-H fit amplitude versus mass subplot from L2A fit products."
+        )
+        self.mass_spectrum_button.toggled.connect(self._on_mass_spectrum_toggled)
+        fit_row_widgets.append(self.mass_spectrum_button)
+        control_buttons.append(self.mass_spectrum_button)
 
         self.same_time_scale_button = QPushButton("Same Time Scale", self)
         self.same_time_scale_button.setCheckable(True)
@@ -6760,14 +7330,19 @@ class MainWindow(QMainWindow):
             timestamp_ms = _guess_event_timestamp_ms(self._data_source, event_name) if self._data_source else None
             timestamp_text = _format_event_dropdown_timestamp(timestamp_ms)
             signal_type = _classify_event_signal_type(self._data_source, event_name)
+            event_label = (
+                self._data_source.format_event_label(event_name)
+                if self._data_source is not None
+                else None
+            ) or f"Event {event_name}"
             if timestamp_text and signal_type:
-                label = f"{timestamp_text} | {signal_type}  [Event {event_name}]"
+                label = f"{timestamp_text} | {signal_type}  [{event_label}]"
             elif timestamp_text:
-                label = f"{timestamp_text}  [Event {event_name}]"
+                label = f"{timestamp_text}  [{event_label}]"
             elif signal_type:
-                label = f"{signal_type}  [Event {event_name}]"
+                label = f"{signal_type}  [{event_label}]"
             else:
-                label = f"Event {event_name}"
+                label = event_label
             self.event_combo.addItem(label, event_name)
         if selected_event is not None:
             self.event_combo.setCurrentIndex(list(events).index(selected_event))
@@ -7359,6 +7934,18 @@ class MainWindow(QMainWindow):
         chosen = prompt_for_data_file(self, preferred=preferred)
         if chosen:
             self.open_file(chosen)
+
+    def action_open_cdf_directory(self) -> None:
+        chosen = prompt_for_cdf_directory(self)
+        if chosen:
+            self.open_file(chosen)
+
+    def action_open_cdf_directory_pair(self) -> None:
+        pair = prompt_for_cdf_directory_pair(self)
+        if not pair:
+            return
+        primary, secondary = pair
+        self.open_file(primary, paired_path=secondary)
 
     def action_open_cdf_pair(self) -> None:
         pair = prompt_for_cdf_pair(self)
@@ -8495,6 +9082,80 @@ class MainWindow(QMainWindow):
         self._show_fit[channel] = checked
         self.plot_event(self._current_event)
 
+    def _mass_spectrum_data(self, event_name: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        params = self._get_dataset(event_name, "Analysis/TOF H Fit Parameters")
+        if params is None:
+            return None
+        param_array = np.asarray(params, dtype=float)
+        if param_array.ndim != 2 or param_array.shape[0] == 0 or param_array.shape[1] < 4:
+            return None
+
+        amplitudes = np.asarray(param_array[:, 0], dtype=float)
+        masses = np.arange(param_array.shape[0], dtype=float)
+
+        areas_raw = self._get_dataset(event_name, "Analysis/TOF H Peak Area")
+        if areas_raw is None:
+            areas = np.full_like(amplitudes, np.nan, dtype=float)
+        else:
+            areas = np.asarray(areas_raw, dtype=float).reshape(-1)
+            if areas.size < amplitudes.size:
+                padded = np.full_like(amplitudes, np.nan, dtype=float)
+                padded[:areas.size] = areas
+                areas = padded
+            else:
+                areas = areas[: amplitudes.size]
+
+        valid = np.isfinite(amplitudes) & (amplitudes > 0)
+        valid |= np.isfinite(areas) & (areas > 0)
+        if not np.any(valid):
+            return None
+        return masses[valid], amplitudes[valid], areas[valid]
+
+    def _plot_mass_spectrum(self, ax, event_name: str) -> bool:
+        spectrum = self._mass_spectrum_data(event_name)
+        if spectrum is None:
+            self._draw_missing_message(ax, "Mass Spectrum", "No TOF-H L2A fit amplitudes")
+            return False
+
+        masses, amplitudes, areas = spectrum
+        font_sizes = self._plot_font_sizes()
+        ax.set_facecolor("#f8f9fb")
+        ax.grid(True, alpha=0.35)
+        ax.vlines(masses, 0.0, amplitudes, color="#c1121f", linewidth=1.2, alpha=0.65, zorder=2)
+        ax.scatter(masses, amplitudes, color="#c1121f", s=22, alpha=0.9, label="Fit amplitude", zorder=3)
+        ax.set_ylabel("Fit amplitude", fontsize=font_sizes["label"])
+        ax.set_xlabel("Mass bin", fontsize=font_sizes["label"])
+        ax.tick_params(axis="both", labelsize=font_sizes["tick"], width=1.5, length=7)
+        ax._custom_xlabel = "Mass bin"
+
+        if np.any(np.isfinite(areas) & (areas > 0)):
+            try:
+                area_text = f"area max {np.nanmax(areas):.3g}"
+            except Exception:
+                area_text = "area available"
+            ax.text(
+                0.99,
+                0.96,
+                area_text,
+                ha="right",
+                va="top",
+                transform=ax.transAxes,
+                fontsize=font_sizes["legend"],
+                color="#1d4ed8",
+                bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "#d0d7de"},
+            )
+
+        if masses.size:
+            xmin = max(float(np.nanmin(masses)) - 1.0, 0.0)
+            xmax = float(np.nanmax(masses)) + 1.0
+            if np.isfinite(xmin) and np.isfinite(xmax) and xmax > xmin:
+                ax.set_xlim(xmin, xmax)
+        return True
+
+    def _on_mass_spectrum_toggled(self, checked: bool):
+        self._show_mass_spectrum = bool(checked)
+        self.plot_event(self._current_event)
+
     # ---- Plotting --------------------------------------------------------
     def plot_event(self, event_name: Optional[str]):
         self.figure.clear()
@@ -8537,6 +9198,7 @@ class MainWindow(QMainWindow):
         channel_order = self._channel_order()
         channel_defs = self._channel_definitions()
         selected = [name for name in channel_order if self.channel_buttons.get(name) and self.channel_buttons[name].isChecked()]
+        show_mass_spectrum = self._show_mass_spectrum and self._mass_spectrum_data(event_name) is not None
         missing: List[str] = []
 
         timestamp_ms = _guess_event_timestamp_ms(self._data_source, event_name)
@@ -8547,7 +9209,7 @@ class MainWindow(QMainWindow):
             fontweight="bold",
         )
 
-        if not selected:
+        if not selected and not show_mass_spectrum:
             ax = self.figure.add_subplot(111)
             self._current_axis_count = 1
             ax.text(
@@ -8587,23 +9249,29 @@ class MainWindow(QMainWindow):
                     families.append((FAMILY_GENERIC, generic))
 
                 if not families:
-                    ax = self.figure.add_subplot(111)
-                    self._current_axis_count = 1
-                    ax.text(
-                        0.5,
-                        0.5,
-                        "No compatible channels selected for overlay.",
-                        ha="center",
-                        va="center",
-                        transform=ax.transAxes,
-                        fontsize=self._plot_font_sizes()["message"],
-                    )
-                    ax.axis("off")
+                    if show_mass_spectrum:
+                        ax = self.figure.add_subplot(111)
+                        axes.append(ax)
+                        self._plot_mass_spectrum(ax, event_name)
+                    else:
+                        ax = self.figure.add_subplot(111)
+                        self._current_axis_count = 1
+                        ax.text(
+                            0.5,
+                            0.5,
+                            "No compatible channels selected for overlay.",
+                            ha="center",
+                            va="center",
+                            transform=ax.transAxes,
+                            fontsize=self._plot_font_sizes()["message"],
+                        )
+                        ax.axis("off")
                 else:
+                    total_rows = len(families) + (1 if show_mass_spectrum else 0)
                     shared_overlay_ax = None
                     for idx, (family, channels) in enumerate(families, start=1):
                         ax = self.figure.add_subplot(
-                            len(families),
+                            total_rows,
                             1,
                             idx,
                             sharex=shared_overlay_ax if same_time_scale else None,
@@ -8614,7 +9282,11 @@ class MainWindow(QMainWindow):
                         plotted_any = False
                         for channel in channels:
                             plotted_any |= self._plot_channel(ax, event_name, channel, overlay_mode=True, missing_channels=missing)
-                        self._style_overlay_axis(ax, event_name, family, bottom=(idx == len(families)))
+                        self._style_overlay_axis(ax, event_name, family, bottom=(idx == len(families) and not show_mass_spectrum))
+                    if show_mass_spectrum:
+                        ax = self.figure.add_subplot(total_rows, 1, total_rows)
+                        axes.append(ax)
+                        self._plot_mass_spectrum(ax, event_name)
             else:
                 ordered = [ch for ch in channel_order if ch in selected]
                 if not ordered:
@@ -8631,7 +9303,8 @@ class MainWindow(QMainWindow):
                     )
                     ax.axis("off")
                 else:
-                    grid = self.figure.add_gridspec(len(ordered), 1, hspace=0.00)
+                    total_rows = len(ordered) + (1 if show_mass_spectrum else 0)
+                    grid = self.figure.add_gridspec(total_rows, 1, hspace=0.00)
                     shared_axes: Dict[str, Any] = {}
                     for idx, channel in enumerate(ordered):
                         family = channel_defs[channel].family
@@ -8647,9 +9320,13 @@ class MainWindow(QMainWindow):
                         self._style_single_axis(
                             ax,
                             channel=channel,
-                            bottom=(idx == len(ordered) - 1),
+                            bottom=(idx == len(ordered) - 1 and not show_mass_spectrum),
                             next_family=next_family,
                         )
+                    if show_mass_spectrum:
+                        ax = self.figure.add_subplot(grid[len(ordered), 0])
+                        axes.append(ax)
+                        self._plot_mass_spectrum(ax, event_name)
         except Exception as exc:
             self.figure.clear()
             self._reset_layout_engine()
@@ -9020,14 +9697,22 @@ class MainWindow(QMainWindow):
             fit_values = np.asarray(curve, dtype=float)
             if fit_values.size != base_time.size:
                 continue
-            baseline_offset = self._estimate_baseline(event_name, channel, base_time)
-            if (
-                baseline_offset
+            baseline_source = self._estimate_baseline(event_name, channel, base_time)
+            if channel == "TOF H":
+                stored_baseline = self._get_dataset(event_name, "Analysis/TOF H Fit Baseline")
+                if stored_baseline is not None:
+                    flat_baseline = np.asarray(stored_baseline, dtype=float).ravel()
+                    if flat_baseline.size and np.isfinite(flat_baseline[0]):
+                        baseline_source = float(flat_baseline[0])
+                if baseline_source and not skip_baseline and not zero_baseline:
+                    fit_values = fit_values + baseline_source
+            elif (
+                baseline_source
                 and not skip_baseline
                 and not zero_baseline
                 and not fit_values_include_baseline
             ):
-                fit_values = fit_values + baseline_offset
+                fit_values = fit_values + baseline_source
 
             label = _label_from_param_path(path)
             fit_t0 = None
@@ -9190,6 +9875,11 @@ class MainWindow(QMainWindow):
         if not self._data_source or not self._current_event:
             for btn in self.fit_buttons.values():
                 btn.setEnabled(False)
+            if self.mass_spectrum_button is not None:
+                self.mass_spectrum_button.setEnabled(False)
+                with QSignalBlocker(self.mass_spectrum_button):
+                    self.mass_spectrum_button.setChecked(False)
+            self._show_mass_spectrum = False
             self._set_edit_fit_controls_enabled(False)
             return
 
@@ -9207,6 +9897,21 @@ class MainWindow(QMainWindow):
                 with QSignalBlocker(btn):
                     btn.setChecked(bool(self._show_fit.get(channel)))
                 btn.setToolTip("Overlay the available fit curve on the channel plot.")
+
+        mass_available = self._mass_spectrum_data(self._current_event) is not None
+        if self.mass_spectrum_button is not None:
+            self.mass_spectrum_button.setEnabled(mass_available)
+            if not mass_available:
+                self._show_mass_spectrum = False
+                with QSignalBlocker(self.mass_spectrum_button):
+                    self.mass_spectrum_button.setChecked(False)
+                self.mass_spectrum_button.setToolTip("No TOF-H L2A fit amplitudes were found for this event.")
+            else:
+                with QSignalBlocker(self.mass_spectrum_button):
+                    self.mass_spectrum_button.setChecked(self._show_mass_spectrum)
+                self.mass_spectrum_button.setToolTip(
+                    "Show a TOF-H fit amplitude versus mass subplot from L2A fit products."
+                )
         self._set_edit_fit_controls_enabled(has_editable)
 
     def update_status_text(self, missing: Optional[List[str]] = None):
@@ -9224,6 +9929,8 @@ class MainWindow(QMainWindow):
         fits_on = [ch for ch, state in self._show_fit.items() if state]
         if fits_on:
             parts.append("Fits: " + ", ".join(sorted(fits_on)))
+        if self._show_mass_spectrum:
+            parts.append("Mass spectrum: ON")
 
         if missing:
             parts.append("Missing: " + ", ".join(sorted(set(missing))))
