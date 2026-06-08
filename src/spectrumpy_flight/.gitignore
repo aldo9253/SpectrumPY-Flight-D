@@ -1,0 +1,14 @@
+CDF/l1a/*
+!CDF/l1a/fetch_l1a.sh
+
+CDF/l1b/*
+!CDF/l1b/fetch_l1b.sh
+
+CDF/l2a/*
+!CDF/l2a/fetch_l2a.sh
+
+CDF/l1a_msg/*
+!CDF/l1a_msg/fetch_l1a_msg.sh
+
+CDF/l1b_msg/*
+!CDF/l1b_msg/fetch_l1b_msg.sh
