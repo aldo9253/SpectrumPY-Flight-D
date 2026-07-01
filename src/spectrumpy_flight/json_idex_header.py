@@ -529,6 +529,7 @@ def _combine_waveform_channels(
         medium,
         low,
         gain_map=gain_map,
+        scale_to_gain=True,
     )
 
 

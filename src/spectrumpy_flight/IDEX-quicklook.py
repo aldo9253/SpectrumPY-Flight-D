@@ -18,6 +18,7 @@ import io
 import base64
 import re
 import json
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1723,6 +1724,8 @@ RISE_METRIC_CHANNELS = {"Ion Grid", "Target L", "Target H"}
 
 BASELINE_PRIMARY_WINDOW = (-7.0, -5.0)
 BASELINE_FALLBACK_THRESHOLD = -2.0
+TOF_BASELINE_WINDOW_US = 3.0
+TOF_BASELINE_CORRECTED_CHANNELS = {"TOF L", "TOF M", "TOF H", "TOF Combined"}
 INTERESTING_EVENT_MIN_PEAK_COUNT = 2
 INTERESTING_EVENT_MIN_PEAK_WIDTH_US = 0.10
 INTERESTING_EVENT_MIN_SINGLE_PEAK_DURATION_US = 0.75
@@ -1954,6 +1957,44 @@ def _robust_baseline_value(values: np.ndarray) -> Optional[float]:
     if clipped.size == 0:
         clipped = samples
     return float(np.median(clipped))
+
+
+def _initial_time_window_mask(times: np.ndarray, *, window_us: float = TOF_BASELINE_WINDOW_US) -> np.ndarray:
+    time_arr = np.asarray(times, dtype=float).reshape(-1)
+    if time_arr.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    if time_arr.size >= 2:
+        diffs = np.diff(time_arr)
+        finite_diffs = diffs[np.isfinite(diffs) & (diffs != 0.0)]
+        dt = float(np.nanmedian(np.abs(finite_diffs))) if finite_diffs.size else 0.0
+        direction = 0.0
+        for diff in diffs:
+            if np.isfinite(diff) and diff != 0.0:
+                direction = math.copysign(1.0, diff)
+                break
+    else:
+        dt = 0.0
+        direction = 0.0
+
+    window = float(window_us) * 1.0e-6 if np.isfinite(dt) and 0.0 < dt < 1.0e-6 else float(window_us)
+    start = float(time_arr[0])
+    if direction > 0.0:
+        mask = (time_arr >= start) & ((time_arr - start) <= window)
+    elif direction < 0.0:
+        mask = (time_arr <= start) & ((start - time_arr) <= window)
+    else:
+        mask = np.abs(time_arr - start) <= window
+
+    mask[0] = True
+    if not np.any(mask):
+        mask = np.zeros(time_arr.size, dtype=bool)
+        if np.isfinite(dt) and dt > 0.0:
+            samples = int(math.ceil(window / dt))
+        else:
+            samples = 50
+        mask[: min(max(samples, 1), time_arr.size)] = True
+    return mask
 
 
 def _fit_paths_from_param(dataset_path: str) -> Optional[Tuple[str, str]]:
@@ -2231,6 +2272,11 @@ class BaseDataSource(ABC):
 
         return None
 
+    def tof_combine_requires_gain_scaling(self, event: str) -> bool:
+        """Return whether TOF combine should normalize DN gain stages."""
+
+        return False
+
     def describe(self) -> str:
         return os.path.basename(self.filename)
 
@@ -2340,6 +2386,7 @@ class HDF5DataSource(BaseDataSource):
                 self._read_dataset(event, "TOF H"),
                 self._read_dataset(event, "TOF M"),
                 self._read_dataset(event, "TOF L"),
+                scale_to_gain=self.tof_combine_requires_gain_scaling(event),
             )
             if combined is not None:
                 return np.asarray(combined, dtype=float)
@@ -2760,6 +2807,9 @@ class CDFDataSource(BaseDataSource):
                 return token
         return None
 
+    def tof_combine_requires_gain_scaling(self, event: str) -> bool:
+        return self._product_level == "l1a"
+
     def _trigger_thresholds_compatible(self) -> bool:
         # L1A CDFs do not publish the decoded trigger-level products that L1B/HDF5
         # carry, but they do retain the raw TXHDR trigger control registers.
@@ -2862,6 +2912,7 @@ class CDFDataSource(BaseDataSource):
             self.get_dataset(event, "TOF H"),
             self.get_dataset(event, "TOF M"),
             self.get_dataset(event, "TOF L"),
+            scale_to_gain=self.tof_combine_requires_gain_scaling(event),
         )
         if combined is None:
             return None
@@ -3625,6 +3676,9 @@ class PairedCDFDataSource(BaseDataSource):
             return value
         return self._fit_source.get_packet_time_seconds(self._fit_event(event))
 
+    def tof_combine_requires_gain_scaling(self, event: str) -> bool:
+        return self._waveform_source.tof_combine_requires_gain_scaling(event)
+
     def get_epoch_seconds(self, event: str) -> Optional[float]:
         value = self._waveform_source.get_epoch_seconds(event)
         if value is not None:
@@ -3814,6 +3868,10 @@ class CDFDirectoryDataSource(BaseDataSource):
     def get_packet_time_seconds(self, event: str) -> Optional[float]:
         source, _path, source_event = self._resolve_event(event)
         return source.get_packet_time_seconds(source_event)
+
+    def tof_combine_requires_gain_scaling(self, event: str) -> bool:
+        source, _path, source_event = self._resolve_event(event)
+        return source.tof_combine_requires_gain_scaling(source_event)
 
     def get_epoch_seconds(self, event: str) -> Optional[float]:
         source, _path, source_event = self._resolve_event(event)
@@ -4047,6 +4105,10 @@ class PairedCDFDirectoryDataSource(BaseDataSource):
     def get_packet_time_seconds(self, event: str) -> Optional[float]:
         source, _path, source_event = self._resolve_event(event)
         return source.get_packet_time_seconds(source_event)
+
+    def tof_combine_requires_gain_scaling(self, event: str) -> bool:
+        source, _path, source_event = self._resolve_event(event)
+        return source.tof_combine_requires_gain_scaling(source_event)
 
     def get_epoch_seconds(self, event: str) -> Optional[float]:
         source, _path, source_event = self._resolve_event(event)
@@ -8412,6 +8474,10 @@ class MainWindow(QMainWindow):
                 event_names=self._events,
                 on_event_changed=self._handle_child_event_change,
                 read_only=read_only,
+                scale_tof_gains=bool(
+                    self._data_source
+                    and self._data_source.tof_combine_requires_gain_scaling(self._current_event)
+                ),
             )
         except Exception as exc:
             if bridge_handle is not None and bridge_path is not None:
@@ -8725,6 +8791,11 @@ class MainWindow(QMainWindow):
             missing_list = ", ".join(missing)
             message = f"{message} (missing: {missing_list})"
         self.statusBar().showMessage(message, 8000)
+        QMessageBox.information(
+            self,
+            "CSV Export Complete",
+            message,
+        )
 
     # ---- Data helpers -----------------------------------------------------
     def _reset_state(self):
@@ -9450,7 +9521,7 @@ class MainWindow(QMainWindow):
             return False
         time_data = self._get_dataset(event_name, definition.time_dataset)
         value_data = self._get_dataset(event_name, definition.dataset)
-        zero_baseline = bool(overlay_mode)
+        zero_baseline = bool(overlay_mode or channel in TOF_BASELINE_CORRECTED_CHANNELS)
         baseline_offset = self._estimate_baseline(event_name, channel, time_data) if zero_baseline else 0.0
         waveform_color = CHANNEL_PLOT_COLORS.get(channel, "#111111")
         waveform_label = channel if overlay_mode else channel
@@ -9597,14 +9668,21 @@ class MainWindow(QMainWindow):
 
         candidate: Optional[float] = None
         if times is not None and times.size == raw_values.size:
-            primary_mask = (times >= BASELINE_PRIMARY_WINDOW[0]) & (times <= BASELINE_PRIMARY_WINDOW[1])
-            candidate = _robust_baseline_value(raw_values[primary_mask])
-            if candidate is None:
-                fallback_mask = times < BASELINE_FALLBACK_THRESHOLD
-                candidate = _robust_baseline_value(raw_values[fallback_mask])
+            if channel in TOF_BASELINE_CORRECTED_CHANNELS:
+                initial_mask = _initial_time_window_mask(times)
+                candidate = _robust_baseline_value(raw_values[initial_mask])
+            else:
+                primary_mask = (times >= BASELINE_PRIMARY_WINDOW[0]) & (times <= BASELINE_PRIMARY_WINDOW[1])
+                candidate = _robust_baseline_value(raw_values[primary_mask])
+                if candidate is None:
+                    fallback_mask = times < BASELINE_FALLBACK_THRESHOLD
+                    candidate = _robust_baseline_value(raw_values[fallback_mask])
 
         if candidate is None:
-            count = min(max(1, raw_values.size // 10), raw_values.size)
+            if channel in TOF_BASELINE_CORRECTED_CHANNELS:
+                count = min(50, raw_values.size)
+            else:
+                count = min(max(1, raw_values.size // 10), raw_values.size)
             subset = raw_values[:count]
             candidate = _robust_baseline_value(subset)
             if candidate is None:
@@ -9830,13 +9908,7 @@ class MainWindow(QMainWindow):
         ax.set_facecolor("#f8f9fb")
         ax.grid(True, alpha=0.35)
         if channel == "TOF Combined":
-            ax.set_yscale("log")
-            # Keep compact plots readable when the autoscaled log range spans less
-            # than a full decade by limiting labels to a small major-tick set.
-            ax.yaxis.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 5.0), numticks=2))
-            ax.yaxis.set_major_formatter(LogFormatterSciNotation(base=10.0, labelOnlyBase=False))
-            ax.yaxis.set_minor_locator(NullLocator())
-            ax.yaxis.set_minor_formatter(NullFormatter())
+            ax.set_yscale("linear")
         else:
             ax.set_yscale("linear")
         ax.tick_params(axis="both", labelsize=font_sizes["tick"], width=1.5, length=7)

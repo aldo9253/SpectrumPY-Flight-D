@@ -5,9 +5,9 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
-GAIN_HIGH = 1600.0
-GAIN_MEDIUM = 40.0
-GAIN_LOW = 1.0
+GAIN_HIGH = 2.89e-4
+GAIN_MEDIUM = 1.13e-2
+GAIN_LOW = 5.14e-1
 
 GAIN_MAP: Dict[str, float] = {
     "TOF H": GAIN_HIGH,
@@ -16,7 +16,20 @@ GAIN_MAP: Dict[str, float] = {
 }
 
 NOISE_BASELINE_WINDOW_US = 3.0
-NOISE_THRESHOLD_SIGMA = 5.0
+NOISE_THRESHOLD_SIGMA    = 5.0
+RAIL_HIGH   = 0.148
+RAIL_MEDIUM = 5.786
+RAIL_LOW    = 263.7
+CROSSFADE_SAMPLES     = 20
+RETURN_STABLE_SAMPLES = 20
+SWITCH_RAIL_FRACTION  = 0.85
+RETURN_RAIL_FRACTION  = 0.85
+
+RAIL_MAP: Dict[str, float] = {
+    "TOF H": RAIL_HIGH,
+    "TOF M": RAIL_MEDIUM,
+    "TOF L": RAIL_LOW,
+}
 
 
 def _contiguous_mask(condition: np.ndarray, min_samples: int) -> np.ndarray:
@@ -197,6 +210,124 @@ def _first_microsecond_mean(values: Optional[np.ndarray], times: Optional[np.nda
     return baseline
 
 
+def _raised_cosine_blend(
+    output: np.ndarray,
+    from_values: np.ndarray,
+    to_values: np.ndarray,
+    start: int,
+    end: int,
+) -> None:
+    start = max(0, int(start))
+    end = min(int(end), output.size)
+    if end <= start:
+        return
+    count = end - start
+    if count == 1:
+        weights = np.array([1.0], dtype=float)
+    else:
+        x = np.linspace(0.0, 1.0, count)
+        weights = 0.5 - 0.5 * np.cos(np.pi * x)
+    source = np.asarray(from_values[start:end], dtype=float)
+    target = np.asarray(to_values[start:end], dtype=float)
+    blended = (1.0 - weights) * source + weights * target
+    finite_source = np.isfinite(source)
+    finite_target = np.isfinite(target)
+    blended = np.where(finite_source & finite_target, blended, np.where(finite_target, target, source))
+    output[start:end] = blended
+
+
+def _combine_hysteresis_crossfade(
+    times: np.ndarray,
+    channel_entries: List[Tuple[str, np.ndarray]],
+    gain_map: Dict[str, float],
+    *,
+    scale_to_gain: bool,
+    length: int,
+) -> Optional[np.ndarray]:
+    if not channel_entries or length <= 0:
+        return None
+
+    names: List[str] = []
+    corrected_values: List[np.ndarray] = []
+    rails: List[float] = []
+    for name, arr in channel_entries:
+        baseline, _ = _baseline_noise_stats(arr, times)
+        corrected = np.asarray(arr[:length], dtype=float) - baseline
+        if scale_to_gain:
+            corrected = corrected * float(gain_map.get(name, 1.0))
+        names.append(name)
+        corrected_values.append(corrected)
+        rails.append(float(RAIL_MAP.get(name, np.inf)))
+
+    if not corrected_values:
+        return None
+
+    if len(corrected_values) == 1:
+        return corrected_values[0].copy()
+
+    output = np.full(length, np.nan, dtype=float)
+    current = 0
+    return_count = 0
+
+    for i in range(length):
+        current_values = corrected_values[current]
+        current_value = current_values[i]
+        current_rail = rails[current]
+
+        if current < len(corrected_values) - 1:
+            at_switch_limit = (
+                np.isfinite(current_value)
+                and np.isfinite(current_rail)
+                and abs(current_value) >= SWITCH_RAIL_FRACTION * current_rail
+            )
+            if at_switch_limit or not np.isfinite(current_value):
+                lower = current + 1
+                blend_start = max(0, i - CROSSFADE_SAMPLES)
+                _raised_cosine_blend(
+                    output,
+                    corrected_values[current],
+                    corrected_values[lower],
+                    blend_start,
+                    i,
+                )
+                current = lower
+                return_count = 0
+                current_values = corrected_values[current]
+                current_value = current_values[i]
+
+        if current > 0:
+            higher = current - 1
+            higher_value = corrected_values[higher][i]
+            higher_rail = rails[higher]
+            below_return_limit = (
+                np.isfinite(higher_value)
+                and np.isfinite(higher_rail)
+                and abs(higher_value) <= RETURN_RAIL_FRACTION * higher_rail
+            )
+            if below_return_limit:
+                return_count += 1
+            else:
+                return_count = 0
+
+            if return_count >= RETURN_STABLE_SAMPLES:
+                blend_start = max(0, i - CROSSFADE_SAMPLES + 1)
+                _raised_cosine_blend(
+                    output,
+                    corrected_values[current],
+                    corrected_values[higher],
+                    blend_start,
+                    i + 1,
+                )
+                current = higher
+                return_count = 0
+                current_values = corrected_values[current]
+                current_value = current_values[i]
+
+        output[i] = current_value
+
+    return output
+
+
 def combine_mid_low_waveforms(
     time_axis: np.ndarray,
     medium: Optional[np.ndarray],
@@ -205,42 +336,15 @@ def combine_mid_low_waveforms(
     gain_map: Optional[Dict[str, float]] = None,
     scale_to_gain: bool = False,
 ) -> Optional[np.ndarray]:
-    if medium is None or low is None or time_axis is None:
-        return None
-
-    times = np.asarray(time_axis, dtype=float)
-    mid_arr = np.asarray(medium, dtype=float)
-    low_arr = np.asarray(low, dtype=float)
-
-    length = min(times.size, mid_arr.size, low_arr.size)
-    if length == 0:
-        return None
-
-    mid_arr = mid_arr[:length]
-    low_arr = low_arr[:length]
-
-    mid_baseline, mid_sigma = _baseline_noise_stats(mid_arr, times)
-    low_baseline, low_sigma = _baseline_noise_stats(low_arr, times)
-    mid_baseline_sub = mid_arr - mid_baseline
-    low_baseline_sub = low_arr - low_baseline
-
-    gain_map = gain_map or GAIN_MAP
-    mid_gain = float(gain_map.get("TOF M", GAIN_MEDIUM))
-    low_gain = float(gain_map.get("TOF L", GAIN_LOW))
-    mid_scale = low_gain / mid_gain if scale_to_gain and mid_gain else 1.0
-    mid_scaled = mid_baseline_sub * mid_scale
-    low_scaled = low_baseline_sub
-
-    combined = mid_scaled.copy()
-    low_threshold = NOISE_THRESHOLD_SIGMA * low_sigma
-    mid_threshold = NOISE_THRESHOLD_SIGMA * mid_sigma
-    low_signal = np.abs(low_baseline_sub) > low_threshold
-    mid_signal = np.abs(mid_baseline_sub) > mid_threshold
-    replace_mask = low_signal & np.isfinite(low_scaled)
-    replace_mask |= (~mid_signal) & np.isfinite(low_scaled) & ~np.isfinite(combined)
-    combined[replace_mask] = low_scaled[replace_mask]
-
-    return combined
+    return combine_waveform_channels(
+        time_axis,
+        None,
+        medium,
+        low,
+        gain_map=gain_map,
+        enabled_channels=("TOF M", "TOF L"),
+        scale_to_gain=scale_to_gain,
+    )
 
 
 def combine_waveform_channels(
@@ -305,40 +409,10 @@ def combine_waveform_channels(
     if not channel_entries:
         return None
 
-    output_gain = min(float(gain_map.get(name, 1.0)) for name, _arr in channel_entries)
-
-    corrected_channels: List[Dict[str, Any]] = []
-    for name, arr in channel_entries:
-        baseline, sigma = _baseline_noise_stats(arr, times)
-        corrected = arr - baseline
-        gain = float(gain_map.get(name, 1.0))
-        scale = output_gain / gain if scale_to_gain and gain else 1.0
-        scaled = corrected * scale
-        threshold = NOISE_THRESHOLD_SIGMA * sigma
-        signal_mask = np.abs(corrected) > threshold
-        corrected_channels.append(
-            {
-                "name": name,
-                "baseline": baseline,
-                "gain": gain,
-                "signal_mask": signal_mask,
-                "scaled": scaled,
-            }
-        )
-
-    combined_corrected = np.full(length, np.nan, dtype=float)
-    source_order = sorted(corrected_channels, key=lambda item: float(item.get("gain", 1.0)))
-    for entry in source_order:
-        candidate = np.asarray(entry["scaled"], dtype=float)
-        signal_mask = np.asarray(entry["signal_mask"], dtype=bool)
-        finite_candidate = np.isfinite(candidate)
-        replace_mask = np.isnan(combined_corrected) & signal_mask & finite_candidate
-        combined_corrected[replace_mask] = candidate[replace_mask]
-
-    for entry in corrected_channels:
-        candidate = np.asarray(entry["scaled"], dtype=float)
-        finite_candidate = np.isfinite(candidate)
-        replace_mask = np.isnan(combined_corrected) & finite_candidate
-        combined_corrected[replace_mask] = candidate[replace_mask]
-
-    return combined_corrected
+    return _combine_hysteresis_crossfade(
+        times,
+        channel_entries,
+        gain_map,
+        scale_to_gain=scale_to_gain,
+        length=length,
+    )

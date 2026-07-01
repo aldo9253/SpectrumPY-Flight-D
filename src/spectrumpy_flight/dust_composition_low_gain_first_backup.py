@@ -863,15 +863,6 @@ def combine_waveform_channels(
     if not arrays:
         return None
 
-    if selected_set == {"TOF M", "TOF L"}:
-        return combine_mid_low_waveforms(
-            time_axis,
-            medium,
-            low,
-            gain_map=gain_map,
-            scale_to_gain=scale_to_gain,
-        )
-
     lengths = [times.size]
     lengths.extend(arr.size for arr in arrays)
     length = min(lengths)

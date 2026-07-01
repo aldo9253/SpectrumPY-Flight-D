@@ -5,9 +5,9 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
-GAIN_HIGH = 1600.0
-GAIN_MEDIUM = 40.0
-GAIN_LOW = 1.0
+GAIN_HIGH = 2.89e-4
+GAIN_MEDIUM = 1.13e-2
+GAIN_LOW = 5.14e-1
 
 GAIN_MAP: Dict[str, float] = {
     "TOF H": GAIN_HIGH,
@@ -219,28 +219,33 @@ def combine_mid_low_waveforms(
     mid_arr = mid_arr[:length]
     low_arr = low_arr[:length]
 
-    mid_baseline, mid_sigma = _baseline_noise_stats(mid_arr, times)
-    low_baseline, low_sigma = _baseline_noise_stats(low_arr, times)
-    mid_baseline_sub = mid_arr - mid_baseline
-    low_baseline_sub = low_arr - low_baseline
+    mid_baseline_sub, mid_baseline = _median_baseline_subtract(mid_arr)
+    low_baseline_sub, _ = _median_baseline_subtract(low_arr)
 
     gain_map = gain_map or GAIN_MAP
     mid_gain = float(gain_map.get("TOF M", GAIN_MEDIUM))
     low_gain = float(gain_map.get("TOF L", GAIN_LOW))
-    mid_scale = low_gain / mid_gain if scale_to_gain and mid_gain else 1.0
-    mid_scaled = mid_baseline_sub * mid_scale
-    low_scaled = low_baseline_sub
+    mid_scaled = mid_baseline_sub * mid_gain if scale_to_gain else mid_baseline_sub
+    low_scaled = low_baseline_sub * low_gain if scale_to_gain else low_baseline_sub
+
+    if not mid_baseline_sub.size:
+        return mid_baseline_sub
+
+    peak = float(np.nanmax(mid_baseline_sub))
+    if not np.isfinite(peak):
+        return mid_baseline_sub
+
+    saturation_threshold = 0.90 * peak
+    saturation_mask = mid_baseline_sub >= saturation_threshold
 
     combined = mid_scaled.copy()
-    low_threshold = NOISE_THRESHOLD_SIGMA * low_sigma
-    mid_threshold = NOISE_THRESHOLD_SIGMA * mid_sigma
-    low_signal = np.abs(low_baseline_sub) > low_threshold
-    mid_signal = np.abs(mid_baseline_sub) > mid_threshold
-    replace_mask = low_signal & np.isfinite(low_scaled)
-    replace_mask |= (~mid_signal) & np.isfinite(low_scaled) & ~np.isfinite(combined)
+    replace_mask = saturation_mask & np.isfinite(low_scaled)
+    replace_mask |= (~np.isfinite(combined)) & np.isfinite(low_scaled)
     combined[replace_mask] = low_scaled[replace_mask]
 
-    return combined
+    if scale_to_gain:
+        return combined
+    return combined + mid_baseline
 
 
 def combine_waveform_channels(
@@ -286,6 +291,15 @@ def combine_waveform_channels(
     if not arrays:
         return None
 
+    if selected_set == {"TOF M", "TOF L"}:
+        return combine_mid_low_waveforms(
+            time_axis,
+            medium,
+            low,
+            gain_map=gain_map,
+            scale_to_gain=scale_to_gain,
+        )
+
     lengths = [times.size]
     lengths.extend(arr.size for arr in arrays)
     length = min(lengths)
@@ -305,40 +319,51 @@ def combine_waveform_channels(
     if not channel_entries:
         return None
 
-    output_gain = min(float(gain_map.get(name, 1.0)) for name, _arr in channel_entries)
+    target_name = channel_entries[0][0]
+    target_gain = float(gain_map.get(target_name, 1.0))
 
     corrected_channels: List[Dict[str, Any]] = []
     for name, arr in channel_entries:
-        baseline, sigma = _baseline_noise_stats(arr, times)
+        baseline = _first_microsecond_mean(arr, times)
         corrected = arr - baseline
         gain = float(gain_map.get(name, 1.0))
-        scale = output_gain / gain if scale_to_gain and gain else 1.0
+        scale = gain if scale_to_gain else 1.0
         scaled = corrected * scale
-        threshold = NOISE_THRESHOLD_SIGMA * sigma
-        signal_mask = np.abs(corrected) > threshold
+        saturation = detect_saturation(arr, times)
         corrected_channels.append(
             {
                 "name": name,
                 "baseline": baseline,
-                "gain": gain,
-                "signal_mask": signal_mask,
                 "scaled": scaled,
+                "saturation": saturation,
             }
         )
 
-    combined_corrected = np.full(length, np.nan, dtype=float)
-    source_order = sorted(corrected_channels, key=lambda item: float(item.get("gain", 1.0)))
-    for entry in source_order:
-        candidate = np.asarray(entry["scaled"], dtype=float)
-        signal_mask = np.asarray(entry["signal_mask"], dtype=bool)
-        finite_candidate = np.isfinite(candidate)
-        replace_mask = np.isnan(combined_corrected) & signal_mask & finite_candidate
-        combined_corrected[replace_mask] = candidate[replace_mask]
+    primary = corrected_channels[0]
+    primary_scaled = np.asarray(primary["scaled"], dtype=float)
+    combined_corrected = primary_scaled.copy()
+    primary_saturation = np.asarray(primary["saturation"], dtype=bool)
+    remaining_mask = primary_saturation.copy()
+    if combined_corrected.size:
+        with np.errstate(invalid="ignore"):
+            remaining_mask |= ~np.isfinite(combined_corrected)
 
-    for entry in corrected_channels:
+    for entry in corrected_channels[1:]:
         candidate = np.asarray(entry["scaled"], dtype=float)
+        candidate_saturation = np.asarray(entry["saturation"], dtype=bool)
         finite_candidate = np.isfinite(candidate)
-        replace_mask = np.isnan(combined_corrected) & finite_candidate
-        combined_corrected[replace_mask] = candidate[replace_mask]
 
+        replace_mask = remaining_mask & ~candidate_saturation & finite_candidate
+
+        if combined_corrected.size:
+            with np.errstate(invalid="ignore"):
+                replace_mask |= (~np.isfinite(combined_corrected)) & ~candidate_saturation & finite_candidate
+
+        combined_corrected[replace_mask] = candidate[replace_mask]
+        remaining_mask &= candidate_saturation
+        remaining_mask &= ~replace_mask
+
+    primary_baseline = 0.0 if scale_to_gain else float(primary.get("baseline", 0.0))
+    if np.isfinite(primary_baseline):
+        return combined_corrected + primary_baseline
     return combined_corrected

@@ -1,3 +1,5 @@
+*.cdf
+
 CDF/l1a/*
 !CDF/l1a/fetch_l1a.sh
 
