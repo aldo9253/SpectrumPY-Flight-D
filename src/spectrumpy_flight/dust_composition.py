@@ -108,6 +108,11 @@ from matplotlib.widgets import SpanSelector
 
 from .plot_style import apply_plot_style
 from .mass_calibration import TOFMassCal
+from .tof_merge import (
+    MAX_SATURATION_GAP_US,
+    SATURATION_RELEASE_FRACTION,
+    combine_waveform_channels as _shared_combine_waveform_channels,
+)
 
 from .line_shapes import (
     double_emg as _line_double_emg,
@@ -785,131 +790,19 @@ def combine_waveform_channels(
     low: Optional[np.ndarray],
     gain_map: Optional[Dict[str, float]] = None,
     enabled_channels: Optional[Iterable[str]] = None,
+    max_saturation_gap_us: float = MAX_SATURATION_GAP_US,
+    saturation_release_fraction: float = SATURATION_RELEASE_FRACTION,
 ) -> Optional[np.ndarray]:
-    """Combine TOF waveforms from multiple gain channels."""
-
-    if time_axis is None:
-        return None
-    times = np.asarray(time_axis, dtype=float)
-    if times.size == 0:
-        return None
-
-    gain_map = gain_map or GAIN_MAP
-
-    valid_order = ("TOF H", "TOF M", "TOF L")
-    selected_set: Optional[Set[str]] = None
-    selected: Optional[List[str]] = None
-    if enabled_channels is not None:
-        selected_set = {str(name) for name in enabled_channels}
-        selected_list = [name for name in valid_order if name in selected_set]
-        if selected_list:
-            selected = selected_list
-
-    channel_map: Dict[str, Optional[np.ndarray]] = {
-        "TOF H": high,
-        "TOF M": medium,
-        "TOF L": low,
-    }
-
-    arrays = [
-        channel_map[name]
-        for name in valid_order
-        if (selected is None or name in selected)
-        and channel_map[name] is not None
-        and getattr(channel_map[name], "size", 0)
-    ]
-    if not arrays:
-        return None
-
-    if selected_set == {"TOF M", "TOF L"}:
-        return combine_mid_low_waveforms(time_axis, medium, low, gain_map=gain_map)
-
-    lengths = [times.size]
-    lengths.extend(arr.size for arr in arrays)
-    length = min(lengths)
-    if length <= 0:
-        return None
-
-    times = times[:length]
-    channel_entries: List[Tuple[str, np.ndarray]] = []
-    for name in valid_order:
-        if selected is not None and name not in selected:
-            continue
-        arr = channel_map[name]
-        if arr is None or not getattr(arr, "size", 0):
-            continue
-        channel_entries.append((name, np.asarray(arr[:length], dtype=float)))
-
-    if not channel_entries:
-        return None
-
-    target_name = channel_entries[0][0]
-    target_gain = float(gain_map.get(target_name, 1.0))
-
-    corrected_channels: List[Dict[str, Any]] = []
-    for name, arr in channel_entries:
-        baseline = _first_microsecond_mean(arr, times)
-        corrected = arr - baseline
-        gain = float(gain_map.get(name, 1.0))
-        scale = target_gain / gain if gain else 1.0
-        scaled = corrected * scale
-        saturation = detect_saturation(arr, times)
-        corrected_channels.append(
-            {
-                "name": name,
-                "scaled": scaled,
-                "saturation": saturation,
-            }
-        )
-
-    primary = corrected_channels[0]
-    primary_scaled = np.asarray(primary["scaled"], dtype=float)
-    combined_corrected = primary_scaled.copy()
-    primary_saturation = np.asarray(primary["saturation"], dtype=bool)
-    remaining_mask = primary_saturation.copy()
-    if combined_corrected.size:
-        with np.errstate(invalid="ignore"):
-            remaining_mask |= ~np.isfinite(combined_corrected)
-
-    primary_reference = primary_scaled.copy()
-    primary_saturated_any = bool(np.any(primary_saturation))
-    manual_override = enabled_channels is not None
-
-    tolerance_lookup = {
-        "TOF M": 0.015,
-        "TOF L": 0.02,
-    }
-
-    for entry in corrected_channels[1:]:
-        candidate = np.asarray(entry["scaled"], dtype=float)
-        candidate_saturation = np.asarray(entry["saturation"], dtype=bool)
-        finite_candidate = np.isfinite(candidate)
-
-        replace_mask = remaining_mask & ~candidate_saturation & finite_candidate
-
-        if combined_corrected.size:
-            with np.errstate(invalid="ignore"):
-                replace_mask |= (~np.isfinite(combined_corrected)) & ~candidate_saturation & finite_candidate
-
-        allow_outperform = manual_override or primary_saturated_any or target_name != "TOF H"
-        if allow_outperform:
-            reference_scale = float(np.nanmax(np.abs(primary_reference))) if primary_reference.size else 0.0
-            candidate_scale = float(np.nanmax(np.abs(candidate))) if candidate.size else 0.0
-            scale_reference = max(reference_scale, candidate_scale)
-            if not np.isfinite(scale_reference) or scale_reference <= 0.0:
-                tolerance = 0.0
-            else:
-                tolerance_ratio = tolerance_lookup.get(entry["name"], 0.015)
-                tolerance = tolerance_ratio * scale_reference + 1.0e-9
-            with np.errstate(invalid="ignore"):
-                outperform_mask = np.abs(candidate) > np.abs(primary_reference) + tolerance
-            replace_mask |= outperform_mask & ~candidate_saturation & finite_candidate
-
-        combined_corrected[replace_mask] = candidate[replace_mask]
-        remaining_mask &= candidate_saturation
-        remaining_mask &= ~replace_mask
-
-    return combined_corrected
+    return _shared_combine_waveform_channels(
+        time_axis,
+        high,
+        medium,
+        low,
+        gain_map=gain_map,
+        enabled_channels=enabled_channels,
+        max_saturation_gap_us=max_saturation_gap_us,
+        saturation_release_fraction=saturation_release_fraction,
+    )
 
 
 def combine_mid_low_waveforms(
@@ -918,47 +811,21 @@ def combine_mid_low_waveforms(
     low: Optional[np.ndarray],
     *,
     gain_map: Optional[Dict[str, float]] = None,
+    max_saturation_gap_us: float = MAX_SATURATION_GAP_US,
+    saturation_release_fraction: float = SATURATION_RELEASE_FRACTION,
 ) -> Optional[np.ndarray]:
-    """Combine TOF M and TOF L using the saturation replacement recipe."""
+    """Combine TOF M and TOF L using the shared TOF merge implementation."""
 
-    if medium is None or low is None or time_axis is None:
-        return None
-
-    times = np.asarray(time_axis, dtype=float)
-    mid_arr = np.asarray(medium, dtype=float)
-    low_arr = np.asarray(low, dtype=float)
-
-    length = min(times.size, mid_arr.size, low_arr.size)
-    if length == 0:
-        return None
-
-    mid_arr = mid_arr[:length]
-    low_arr = low_arr[:length]
-
-    mid_baseline_sub, _ = _median_baseline_subtract(mid_arr)
-    low_baseline_sub, _ = _median_baseline_subtract(low_arr)
-
-    gain_map = gain_map or GAIN_MAP
-    mid_gain = float(gain_map.get("TOF M", GAIN_MEDIUM))
-    low_gain = float(gain_map.get("TOF L", GAIN_LOW))
-    scale = mid_gain / low_gain if low_gain else 1.0
-    low_scaled = low_baseline_sub * scale
-
-    if not mid_baseline_sub.size:
-        return mid_baseline_sub
-
-    peak = float(np.nanmax(mid_baseline_sub))
-    if not np.isfinite(peak):
-        return mid_baseline_sub
-
-    saturation_threshold = 0.90 * peak
-    saturation_mask = mid_baseline_sub >= saturation_threshold
-
-    combined = mid_baseline_sub.copy()
-    replace_mask = saturation_mask & np.isfinite(low_scaled)
-    combined[replace_mask] = low_scaled[replace_mask]
-
-    return combined
+    return _shared_combine_waveform_channels(
+        time_axis,
+        None,
+        medium,
+        low,
+        gain_map=gain_map,
+        enabled_channels=("TOF M", "TOF L"),
+        max_saturation_gap_us=max_saturation_gap_us,
+        saturation_release_fraction=saturation_release_fraction,
+    )
 
 
 def _load_mass_reference() -> List[Tuple[float, str]]:

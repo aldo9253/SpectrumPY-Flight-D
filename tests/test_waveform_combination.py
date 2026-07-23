@@ -102,6 +102,25 @@ from spectrumpy_flight.dust_composition import (
     combine_waveform_channels,
     detect_saturation,
 )
+from spectrumpy_flight.tof_merge import DN_MIDPOINT, DN_SATURATION_LIMIT, SATURATION_RELEASE_FRACTION, TOF_CONVERSION_FACTORS
+
+SATURATION_EFFECTIVE_LIMIT = DN_SATURATION_LIMIT * SATURATION_RELEASE_FRACTION
+HIGH_GAIN_SCALE = GAIN_HIGH / GAIN_MEDIUM
+MID_GAIN_SCALE = 1.0
+LOW_GAIN_SCALE = GAIN_LOW / GAIN_MEDIUM
+
+
+def _normalize_expected(values: np.ndarray, channel: str) -> np.ndarray:
+    if channel == "TOF H":
+        scale = HIGH_GAIN_SCALE
+        offset = DN_MIDPOINT * TOF_CONVERSION_FACTORS["TOF H"]
+    elif channel == "TOF L":
+        scale = LOW_GAIN_SCALE
+        offset = DN_MIDPOINT * TOF_CONVERSION_FACTORS["TOF L"]
+    else:
+        scale = MID_GAIN_SCALE
+        offset = DN_MIDPOINT * TOF_CONVERSION_FACTORS["TOF M"]
+    return (np.asarray(values, dtype=float) - offset) * scale
 
 
 def test_detect_saturation_flags_clipped_segments_with_jitter():
@@ -130,80 +149,265 @@ def test_combine_waveform_channels_replaces_saturated_high_with_medium():
     times = np.linspace(0.0, 31.5, 4096)
     physical_signal = 0.5 * np.exp(-0.5 * ((times - 6.0) / 0.4) ** 2)
 
-    high_baseline = 1200.0
+    high_baseline = 900.0
     medium_baseline = 75.0
 
-    high = high_baseline + physical_signal * GAIN_HIGH
-    medium = medium_baseline + physical_signal * GAIN_MEDIUM
+    high_raw = high_baseline + physical_signal * GAIN_HIGH
+    medium_raw = medium_baseline + physical_signal * GAIN_MEDIUM
+    high = high_raw * TOF_CONVERSION_FACTORS["TOF H"]
+    medium = medium_raw * TOF_CONVERSION_FACTORS["TOF M"]
 
-    saturation_mask = (times >= 5.4) & (times <= 6.6)
-    high[saturation_mask] = high_baseline + 0.75 * GAIN_HIGH
+    saturation_mask = high_raw >= SATURATION_EFFECTIVE_LIMIT
 
     combined = combine_waveform_channels(times, high, medium, None)
     assert combined is not None
 
-    baseline_mask = times <= (times[0] + 1.0)
-    high_mean = np.mean(high[baseline_mask])
-    medium_mean = np.mean(medium[baseline_mask])
-
-    expected = high - high_mean
-    expected[saturation_mask] = (medium[saturation_mask] - medium_mean) * (GAIN_HIGH / GAIN_MEDIUM)
-
-    assert np.allclose(np.mean(combined[baseline_mask]), 0.0, atol=1e-6)
+    expected = _normalize_expected(high, "TOF H")
+    expected[saturation_mask] = _normalize_expected(medium, "TOF M")[saturation_mask]
 
     assert np.allclose(combined, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_combine_waveform_channels_uses_low_when_high_and_medium_saturate():
     times = np.linspace(0.0, 31.5, 2048)
-    physical_signal = 0.25 + 0.45 * np.exp(-((times - 7.5) / 0.35) ** 2)
+    physical_signal = 30.0 * np.exp(-((times - 7.5) / 0.35) ** 2)
 
     high_baseline = 980.0
     medium_baseline = 63.0
     low_baseline = -4.5
 
-    high = high_baseline + physical_signal * GAIN_HIGH
-    medium = medium_baseline + physical_signal * GAIN_MEDIUM
-    low = low_baseline + physical_signal * GAIN_LOW
+    high_raw = high_baseline + physical_signal * GAIN_HIGH
+    medium_raw = medium_baseline + physical_signal * GAIN_MEDIUM
+    low_raw = low_baseline + physical_signal * GAIN_LOW
 
-    clip_mask = (times >= 6.9) & (times <= 8.2)
-    high[clip_mask] = high_baseline + 0.6 * GAIN_HIGH
-    medium[clip_mask] = medium_baseline + 0.6 * GAIN_MEDIUM
+    high = high_raw * TOF_CONVERSION_FACTORS["TOF H"]
+    medium = medium_raw * TOF_CONVERSION_FACTORS["TOF M"]
+    low = low_raw * TOF_CONVERSION_FACTORS["TOF L"]
+
+    high_saturation_mask = high_raw >= SATURATION_EFFECTIVE_LIMIT
+    medium_saturation_mask = medium_raw >= SATURATION_EFFECTIVE_LIMIT
 
     combined = combine_waveform_channels(times, high, medium, low)
     assert combined is not None
 
-    baseline_mask = times <= (times[0] + 1.0)
-    high_mean = np.mean(high[baseline_mask])
-    medium_mean = np.mean(medium[baseline_mask])
-    low_mean = np.mean(low[baseline_mask])
-
-    expected = high - high_mean
-    expected[clip_mask] = (medium[clip_mask] - medium_mean) * (GAIN_HIGH / GAIN_MEDIUM)
-
-    medium_clip_mask = clip_mask
-    expected[medium_clip_mask] = (low[medium_clip_mask] - low_mean) * (GAIN_HIGH / GAIN_LOW)
-
-    assert np.allclose(np.mean(combined[baseline_mask]), 0.0, atol=1e-6)
+    expected = _normalize_expected(high, "TOF H")
+    expected[high_saturation_mask] = _normalize_expected(medium, "TOF M")[high_saturation_mask]
+    expected[medium_saturation_mask] = _normalize_expected(low, "TOF L")[medium_saturation_mask]
 
     assert np.allclose(combined, expected, rtol=1e-6, atol=1e-6)
 
 
-def test_combine_waveform_channels_prefers_high_when_unsaturated():
-    times = np.linspace(0.0, 31.5, 4096)
-    physical_signal = 0.42 * np.exp(-0.5 * ((times - 6.0) / 0.55) ** 2)
+def test_combine_waveform_channels_uses_low_when_only_medium_and_low_selected():
+    times = np.linspace(0.0, 31.5, 2048)
+    physical_signal = 30.0 * np.exp(-((times - 7.5) / 0.35) ** 2)
 
-    high_baseline = 1120.0
-    medium_baseline = 74.0
+    medium_baseline = 63.0
+    low_baseline = -4.5
 
-    high = high_baseline + physical_signal * GAIN_HIGH
-    medium = medium_baseline + 1.12 * physical_signal * GAIN_MEDIUM
+    medium_raw = medium_baseline + physical_signal * GAIN_MEDIUM
+    low_raw = low_baseline + physical_signal * GAIN_LOW
+
+    medium = medium_raw * TOF_CONVERSION_FACTORS["TOF M"]
+    low = low_raw * TOF_CONVERSION_FACTORS["TOF L"]
+
+    medium_saturation_mask = medium_raw >= SATURATION_EFFECTIVE_LIMIT
+
+    combined = combine_waveform_channels(
+        times,
+        None,
+        medium,
+        low,
+        enabled_channels=("TOF M", "TOF L"),
+    )
+    assert combined is not None
+
+    expected = _normalize_expected(medium, "TOF M")
+    expected[medium_saturation_mask] = _normalize_expected(low, "TOF L")[medium_saturation_mask]
+    assert np.allclose(combined, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_combine_waveform_channels_bridges_short_high_gain_saturation_dips():
+    times = np.linspace(0.0, 31.5, 2048)
+    physical_signal = 0.45 * np.exp(-0.5 * ((times - 4.0) / 0.18) ** 2)
+
+    high_baseline = 900.0
+    medium_baseline = 72.0
+
+    high_raw = high_baseline + physical_signal * GAIN_HIGH
+    medium_raw = medium_baseline + physical_signal * GAIN_MEDIUM
+
+    saturation_region = (times >= 3.85) & (times <= 4.25)
+    dip_region = (times >= 4.00) & (times <= 4.28)
+
+    high_raw[saturation_region] = 1020.0
+    high_raw[dip_region] = 917.0
+
+    high = high_raw * TOF_CONVERSION_FACTORS["TOF H"]
+    medium = medium_raw * TOF_CONVERSION_FACTORS["TOF M"]
 
     combined = combine_waveform_channels(times, high, medium, None)
     assert combined is not None
 
-    baseline_mask = times <= (times[0] + 1.0)
-    expected = high - np.mean(high[baseline_mask])
+    expected = _normalize_expected(high, "TOF H")
+    high_saturation_mask = high_raw >= SATURATION_EFFECTIVE_LIMIT
+    expected[high_saturation_mask] = _normalize_expected(medium, "TOF M")[high_saturation_mask]
+    expected[dip_region] = _normalize_expected(medium, "TOF M")[dip_region]
+
+    assert np.allclose(combined, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_combine_waveform_channels_respects_gap_setting():
+    times = np.linspace(0.0, 31.5, 2048)
+    physical_signal = 0.45 * np.exp(-0.5 * ((times - 4.0) / 0.18) ** 2)
+
+    high_baseline = 900.0
+    medium_baseline = 72.0
+
+    high_raw = high_baseline + physical_signal * GAIN_HIGH
+    medium_raw = medium_baseline + physical_signal * GAIN_MEDIUM
+
+    saturation_region = (times >= 3.85) & (times <= 4.25)
+    dip_region = (times >= 4.00) & (times <= 4.28)
+
+    high_raw[saturation_region] = 1020.0
+    high_raw[dip_region] = 917.0
+
+    high = high_raw * TOF_CONVERSION_FACTORS["TOF H"]
+    medium = medium_raw * TOF_CONVERSION_FACTORS["TOF M"]
+
+    combined = combine_waveform_channels(times, high, medium, None, max_saturation_gap_us=0.0)
+    assert combined is not None
+
+    expected = _normalize_expected(high, "TOF H")
+    high_saturation_mask = high_raw >= SATURATION_EFFECTIVE_LIMIT
+    expected[high_saturation_mask] = _normalize_expected(medium, "TOF M")[high_saturation_mask]
+
+    assert np.allclose(combined, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_combine_waveform_channels_keeps_low_when_mid_gain_rings_below_hard_limit():
+    times = np.linspace(0.0, 31.5, 2048)
+    physical_signal = 0.05 * np.exp(-0.5 * ((times - 4.0) / 0.20) ** 2)
+
+    high_baseline = 900.0
+    medium_baseline = 610.0
+    low_baseline = 48.0
+
+    high_raw = high_baseline + physical_signal * GAIN_HIGH
+    medium_raw = medium_baseline + physical_signal * GAIN_MEDIUM
+    low_raw = low_baseline + physical_signal * GAIN_LOW
+
+    ring_region = (times >= 3.90) & (times <= 4.30)
+    dip_region = (times >= 4.02) & (times <= 4.28)
+
+    high_raw[ring_region] = 1020.0
+    medium_raw[ring_region] = 1000.0
+    medium_raw[dip_region] = 917.0
+
+    high = high_raw * TOF_CONVERSION_FACTORS["TOF H"]
+    medium = medium_raw * TOF_CONVERSION_FACTORS["TOF M"]
+    low = low_raw * TOF_CONVERSION_FACTORS["TOF L"]
+
+    combined = combine_waveform_channels(times, high, medium, low)
+    assert combined is not None
+
+    expected = _normalize_expected(high, "TOF H")
+    high_saturation_mask = high_raw >= SATURATION_EFFECTIVE_LIMIT
+    medium_saturation_mask = medium_raw >= SATURATION_EFFECTIVE_LIMIT
+    expected[high_saturation_mask] = _normalize_expected(medium, "TOF M")[high_saturation_mask]
+    expected[medium_saturation_mask] = _normalize_expected(low, "TOF L")[medium_saturation_mask]
+
+    assert np.allclose(combined, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_combine_waveform_channels_respects_release_fraction_setting():
+    times = np.linspace(0.0, 31.5, 2048)
+    physical_signal = 0.05 * np.exp(-0.5 * ((times - 4.0) / 0.20) ** 2)
+
+    high_baseline = 900.0
+    medium_baseline = 610.0
+    low_baseline = 48.0
+
+    high_raw = high_baseline + physical_signal * GAIN_HIGH
+    medium_raw = medium_baseline + physical_signal * GAIN_MEDIUM
+    low_raw = low_baseline + physical_signal * GAIN_LOW
+
+    ring_region = (times >= 3.90) & (times <= 4.30)
+    high_raw[ring_region] = 1020.0
+    medium_raw[ring_region] = np.linspace(800.0, 990.0, int(np.count_nonzero(ring_region)))
+
+    high = high_raw * TOF_CONVERSION_FACTORS["TOF H"]
+    medium = medium_raw * TOF_CONVERSION_FACTORS["TOF M"]
+    low = low_raw * TOF_CONVERSION_FACTORS["TOF L"]
+
+    combined = combine_waveform_channels(
+        times,
+        high,
+        medium,
+        low,
+        saturation_release_fraction=0.98,
+    )
+    assert combined is not None
+
+    expected = _normalize_expected(high, "TOF H")
+    expected[ring_region] = _normalize_expected(medium, "TOF M")[ring_region]
+
+    assert np.allclose(combined, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_combine_waveform_channels_demotes_ringy_mid_gain_below_ceiling():
+    times = np.linspace(0.0, 31.5, 2048)
+    physical_signal = 0.10 * np.exp(-0.5 * ((times - 4.0) / 0.20) ** 2)
+
+    high_baseline = 900.0
+    medium_baseline = 74.0
+    low_baseline = 48.0
+
+    high_raw = high_baseline + physical_signal * GAIN_HIGH
+    medium_raw = medium_baseline + physical_signal * GAIN_MEDIUM
+    low_raw = low_baseline + physical_signal * GAIN_LOW
+
+    ring_region = (times >= 3.90) & (times <= 4.30)
+    high_raw[ring_region] = 1020.0
+    medium_raw[ring_region] = 900.0
+
+    high = high_raw * TOF_CONVERSION_FACTORS["TOF H"]
+    medium = medium_raw * TOF_CONVERSION_FACTORS["TOF M"]
+    low = low_raw * TOF_CONVERSION_FACTORS["TOF L"]
+
+    combined = combine_waveform_channels(
+        times,
+        high,
+        medium,
+        low,
+        saturation_release_fraction=1.0,
+    )
+    assert combined is not None
+
+    expected = _normalize_expected(low, "TOF L")
+
+    assert np.allclose(combined[ring_region], expected[ring_region], rtol=1e-6, atol=1e-6)
+
+
+def test_combine_waveform_channels_prefers_high_when_unsaturated():
+    times = np.linspace(0.0, 31.5, 4096)
+    physical_signal = 0.2 * np.exp(-0.5 * ((times - 6.0) / 0.55) ** 2)
+
+    high_baseline = 620.0
+    medium_baseline = 74.0
+
+    high_raw = high_baseline + physical_signal * GAIN_HIGH
+    medium_raw = medium_baseline + 1.12 * physical_signal * GAIN_MEDIUM
+
+    high = high_raw * TOF_CONVERSION_FACTORS["TOF H"]
+    medium = medium_raw * TOF_CONVERSION_FACTORS["TOF M"]
+
+    combined = combine_waveform_channels(times, high, medium, None)
+    assert combined is not None
+
+    expected = _normalize_expected(high, "TOF H")
+    high_saturation_mask = high_raw >= SATURATION_EFFECTIVE_LIMIT
+    expected[high_saturation_mask] = _normalize_expected(medium, "TOF M")[high_saturation_mask]
 
     assert np.allclose(combined, expected, rtol=1e-6, atol=1e-6)
 
@@ -225,8 +429,7 @@ def test_combine_waveform_channels_respects_manual_selection():
 
     assert combined is not None
 
-    baseline_mask = times <= (times[0] + 1.0)
-    expected = medium - np.mean(medium[baseline_mask])
+    expected = _normalize_expected(medium, "TOF M")
 
     assert np.allclose(combined, expected, rtol=1e-6, atol=1e-6)
 
@@ -241,11 +444,5 @@ def test_combine_waveform_channels_baseline_with_descending_time_axis():
     combined = combine_waveform_channels(times, high, None, None)
     assert combined is not None
 
-    start = times[0]
-    baseline_mask = (start - times) <= 1.0
-    assert baseline_mask.any()
-
-    expected = high - np.mean(high[baseline_mask])
-
-    assert np.allclose(np.mean(combined[baseline_mask]), 0.0, atol=1e-6)
+    expected = _normalize_expected(high, "TOF H")
     np.testing.assert_allclose(combined, expected, rtol=1e-6, atol=1e-6)

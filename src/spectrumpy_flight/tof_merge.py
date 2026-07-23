@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
@@ -14,6 +13,26 @@ GAIN_MAP: Dict[str, float] = {
     "TOF M": GAIN_MEDIUM,
     "TOF L": GAIN_LOW,
 }
+
+# The TOF ADC is 10-bit. Treat values at or above this DN ceiling as saturated
+# and fall back to the next lower gain stage.
+DN_SATURATION_LIMIT = 1020.0
+
+# The packet/HDF5 writers convert raw DN into engineering units by multiplying
+# by the channel-specific conversion factor. Use the same factors here so the
+# saturation threshold is evaluated in the same units as the stored waveform.
+TOF_CONVERSION_FACTORS: Dict[str, float] = {
+    "TOF H": 2.89e-4,
+    "TOF M": 1.13e-2,
+    "TOF L": 5.14e-4,
+}
+
+# Treat midscale as the zero point for TOF combine.
+DN_MIDPOINT = 512.0
+MAX_SATURATION_GAP_US = 0.4
+# Keep a little hysteresis below the hard saturation limit so ringing traces
+# do not drop back to a higher-gain channel too early.
+SATURATION_RELEASE_FRACTION = 0.89
 
 
 def _contiguous_mask(condition: np.ndarray, min_samples: int) -> np.ndarray:
@@ -30,17 +49,34 @@ def _contiguous_mask(condition: np.ndarray, min_samples: int) -> np.ndarray:
     return mask
 
 
-def _median_baseline_subtract(values: np.ndarray, *, samples: int = 200) -> Tuple[np.ndarray, float]:
-    arr = np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return arr, 0.0
+def _bridge_short_false_gaps(
+    mask: np.ndarray,
+    times: np.ndarray,
+    *,
+    max_gap_us: float,
+) -> np.ndarray:
+    if mask.size == 0 or max_gap_us <= 0:
+        return np.asarray(mask, dtype=bool)
 
-    npre = min(int(samples), arr.size)
-    if npre <= 0:
-        return arr, 0.0
+    result = np.asarray(mask, dtype=bool).copy()
+    time_arr = np.asarray(times, dtype=float)
+    if time_arr.size != result.size or result.size == 0:
+        return result
 
-    baseline = float(np.nanmedian(arr[:npre]))
-    return arr - baseline, baseline
+    padded = np.concatenate(([False], result, [False])).astype(int)
+    diff = np.diff(padded)
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    if starts.size < 2:
+        return result
+
+    for left_end, right_start in zip(ends[:-1], starts[1:]):
+        if left_end == 0 or right_start >= time_arr.size:
+            continue
+        gap = abs(float(time_arr[right_start]) - float(time_arr[left_end - 1]))
+        if gap <= max_gap_us:
+            result[left_end:right_start] = True
+    return result
 
 
 def detect_saturation(values: np.ndarray, times: np.ndarray) -> np.ndarray:
@@ -90,72 +126,28 @@ def detect_saturation(values: np.ndarray, times: np.ndarray) -> np.ndarray:
     return _contiguous_mask(plateau_mask, 3)
 
 
-def _first_microsecond_mean(values: Optional[np.ndarray], times: Optional[np.ndarray]) -> float:
-    if values is None:
-        return 0.0
-
+def _to_midpoint_corrected(values: np.ndarray, channel: str) -> np.ndarray:
     arr = np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return 0.0
+    offset = DN_MIDPOINT * TOF_CONVERSION_FACTORS.get(channel, 1.0)
+    return arr - offset
 
-    if times is None:
-        sample_count = min(arr.size, 50)
-        if sample_count == 0:
-            return 0.0
-        return float(np.nanmean(arr[:sample_count]))
 
-    time_arr = np.asarray(times, dtype=float)
-    if time_arr.size == 0:
-        sample_count = min(arr.size, 50)
-        if sample_count == 0:
-            return 0.0
-        return float(np.nanmean(arr[:sample_count]))
-
-    length = min(arr.size, time_arr.size)
-    if length == 0:
-        return 0.0
-
-    arr = arr[:length]
-    time_arr = time_arr[:length]
-
-    if length >= 2:
-        diffs = np.diff(time_arr)
-        finite_diffs = diffs[np.isfinite(diffs) & (diffs != 0.0)]
-        dt = float(np.nanmedian(np.abs(finite_diffs))) if finite_diffs.size else 0.0
-        direction = 0.0
-        for diff in diffs:
-            if np.isfinite(diff) and diff != 0.0:
-                direction = math.copysign(1.0, diff)
-                break
-    else:
-        dt = 0.0
-        direction = 0.0
-
-    if np.isfinite(dt) and dt > 0.0 and dt < 1.0e-6:
-        window = 1.0e-6
-    else:
-        window = 1.0
-
-    start = float(time_arr[0])
-    if direction > 0.0:
-        mask = (time_arr >= start) & ((time_arr - start) <= window)
-    elif direction < 0.0:
-        mask = (time_arr <= start) & ((start - time_arr) <= window)
-    else:
-        mask = np.abs(time_arr - start) <= window
-
-    mask[0] = True
-
-    if not np.any(mask):
-        if np.isfinite(dt) and dt > 0.0:
-            samples = int(math.ceil(window / dt))
-        else:
-            samples = 50
-        samples = min(max(samples, 1), length)
-        mask = np.zeros(length, dtype=bool)
-        mask[:samples] = True
-
-    return float(np.nanmean(arr[mask]))
+def _to_reference_gain_scale(
+    values: np.ndarray,
+    channel: str,
+    *,
+    gain_map: Optional[Dict[str, float]],
+    reference_channel: str = "TOF M",
+) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    active_gain_map = gain_map or GAIN_MAP
+    reference_gain = float(active_gain_map.get(reference_channel, GAIN_MEDIUM))
+    if not np.isfinite(reference_gain) or reference_gain <= 0.0:
+        reference_gain = GAIN_MEDIUM
+    channel_gain = float(active_gain_map.get(channel, 1.0))
+    if not np.isfinite(channel_gain) or channel_gain <= 0.0:
+        channel_gain = 1.0
+    return arr * (channel_gain / reference_gain)
 
 
 def combine_mid_low_waveforms(
@@ -164,6 +156,8 @@ def combine_mid_low_waveforms(
     low: Optional[np.ndarray],
     *,
     gain_map: Optional[Dict[str, float]] = None,
+    max_saturation_gap_us: float = MAX_SATURATION_GAP_US,
+    saturation_release_fraction: float = SATURATION_RELEASE_FRACTION,
 ) -> Optional[np.ndarray]:
     if medium is None or low is None or time_axis is None:
         return None
@@ -179,31 +173,33 @@ def combine_mid_low_waveforms(
     mid_arr = mid_arr[:length]
     low_arr = low_arr[:length]
 
-    mid_baseline_sub, mid_baseline = _median_baseline_subtract(mid_arr)
-    low_baseline_sub, _ = _median_baseline_subtract(low_arr)
-
     gain_map = gain_map or GAIN_MAP
-    mid_gain = float(gain_map.get("TOF M", GAIN_MEDIUM))
-    low_gain = float(gain_map.get("TOF L", GAIN_LOW))
-    scale = mid_gain / low_gain if low_gain else 1.0
-    low_scaled = low_baseline_sub * scale
+    mid_corrected = _to_midpoint_corrected(mid_arr, "TOF M")
+    mid_corrected = _to_reference_gain_scale(mid_corrected, "TOF M", gain_map=gain_map)
+    low_corrected = _to_midpoint_corrected(low_arr, "TOF L")
+    low_corrected = _to_reference_gain_scale(low_corrected, "TOF L", gain_map=gain_map)
 
-    if not mid_baseline_sub.size:
-        return mid_baseline_sub
+    mid_threshold = DN_SATURATION_LIMIT
 
-    peak = float(np.nanmax(mid_baseline_sub))
-    if not np.isfinite(peak):
-        return mid_baseline_sub
+    if not mid_corrected.size:
+        return mid_corrected
 
-    saturation_threshold = 0.90 * peak
-    saturation_mask = mid_baseline_sub >= saturation_threshold
+    saturation_mask = (mid_arr / TOF_CONVERSION_FACTORS.get("TOF M", 1.0)) >= mid_threshold
+    saturation_mask |= (mid_arr / TOF_CONVERSION_FACTORS.get("TOF M", 1.0)) >= (
+        DN_SATURATION_LIMIT * saturation_release_fraction
+    )
+    saturation_mask = _bridge_short_false_gaps(
+        saturation_mask,
+        times,
+        max_gap_us=max_saturation_gap_us,
+    )
 
-    combined = mid_baseline_sub.copy()
-    replace_mask = saturation_mask & np.isfinite(low_scaled)
-    replace_mask |= (~np.isfinite(combined)) & np.isfinite(low_scaled)
-    combined[replace_mask] = low_scaled[replace_mask]
+    combined = mid_corrected.copy()
+    replace_mask = saturation_mask & np.isfinite(low_corrected)
+    replace_mask |= (~np.isfinite(combined)) & np.isfinite(low_corrected)
+    combined[replace_mask] = low_corrected[replace_mask]
 
-    return combined + mid_baseline
+    return combined
 
 
 def combine_waveform_channels(
@@ -213,6 +209,8 @@ def combine_waveform_channels(
     low: Optional[np.ndarray],
     gain_map: Optional[Dict[str, float]] = None,
     enabled_channels: Optional[Iterable[str]] = None,
+    max_saturation_gap_us: float = MAX_SATURATION_GAP_US,
+    saturation_release_fraction: float = SATURATION_RELEASE_FRACTION,
 ) -> Optional[np.ndarray]:
     if time_axis is None:
         return None
@@ -249,7 +247,14 @@ def combine_waveform_channels(
         return None
 
     if selected_set == {"TOF M", "TOF L"}:
-        return combine_mid_low_waveforms(time_axis, medium, low, gain_map=gain_map)
+        return combine_mid_low_waveforms(
+            time_axis,
+            medium,
+            low,
+            gain_map=gain_map,
+            max_saturation_gap_us=max_saturation_gap_us,
+            saturation_release_fraction=saturation_release_fraction,
+        )
 
     lengths = [times.size]
     lengths.extend(arr.size for arr in arrays)
@@ -270,51 +275,58 @@ def combine_waveform_channels(
     if not channel_entries:
         return None
 
-    target_name = channel_entries[0][0]
-    target_gain = float(gain_map.get(target_name, 1.0))
-
     corrected_channels: List[Dict[str, Any]] = []
     for name, arr in channel_entries:
-        baseline = _first_microsecond_mean(arr, times)
-        corrected = arr - baseline
+        corrected = _to_midpoint_corrected(arr, name)
+        conversion = TOF_CONVERSION_FACTORS.get(name, 1.0)
         gain = float(gain_map.get(name, 1.0))
-        scale = target_gain / gain if gain else 1.0
-        scaled = corrected * scale
-        saturation = detect_saturation(arr, times)
+        dn_values = np.asarray(arr, dtype=float) / conversion
+        saturation = dn_values >= DN_SATURATION_LIMIT
+        saturation |= dn_values >= (DN_SATURATION_LIMIT * saturation_release_fraction)
+        # Catch clipped ring-downs that dip below the hard ceiling but still
+        # retain the plateau / repeat signature of saturation.
+        saturation |= detect_saturation(dn_values, times)
+        corrected = _to_reference_gain_scale(
+            corrected,
+            name,
+            gain_map=gain_map,
+            reference_channel="TOF M",
+        )
+        saturation = _bridge_short_false_gaps(
+            saturation,
+            times,
+            max_gap_us=max_saturation_gap_us,
+        )
         corrected_channels.append(
             {
                 "name": name,
-                "baseline": baseline,
-                "scaled": scaled,
+                "corrected": corrected,
+                "gain": gain,
                 "saturation": saturation,
             }
         )
 
-    primary = corrected_channels[0]
-    primary_scaled = np.asarray(primary["scaled"], dtype=float)
-    combined_corrected = primary_scaled.copy()
-    primary_saturation = np.asarray(primary["saturation"], dtype=bool)
-    remaining_mask = primary_saturation.copy()
-    if combined_corrected.size:
-        with np.errstate(invalid="ignore"):
-            remaining_mask |= ~np.isfinite(combined_corrected)
+    corrected_stack = np.vstack([np.asarray(entry["corrected"], dtype=float) for entry in corrected_channels])
+    saturation_stack = np.vstack([np.asarray(entry["saturation"], dtype=bool) for entry in corrected_channels])
+    gains = np.asarray([float(entry["gain"]) for entry in corrected_channels], dtype=float)
+    finite_stack = np.isfinite(corrected_stack)
+    unsaturated_stack = finite_stack & ~saturation_stack
 
-    for entry in corrected_channels[1:]:
-        candidate = np.asarray(entry["scaled"], dtype=float)
-        candidate_saturation = np.asarray(entry["saturation"], dtype=bool)
-        finite_candidate = np.isfinite(candidate)
+    combined = np.full(length, np.nan, dtype=float)
 
-        replace_mask = remaining_mask & ~candidate_saturation & finite_candidate
+    has_unsaturated = np.any(unsaturated_stack, axis=0)
+    if np.any(has_unsaturated):
+        best_unsaturated = np.argmax(np.where(unsaturated_stack, gains[:, None], -np.inf), axis=0)
+        col_idx = np.nonzero(has_unsaturated)[0]
+        combined[col_idx] = corrected_stack[best_unsaturated[col_idx], col_idx]
 
-        if combined_corrected.size:
-            with np.errstate(invalid="ignore"):
-                replace_mask |= (~np.isfinite(combined_corrected)) & ~candidate_saturation & finite_candidate
+    remaining = ~has_unsaturated
+    if np.any(remaining):
+        has_saturated = np.any(finite_stack, axis=0)
+        fallback = remaining & has_saturated
+        if np.any(fallback):
+            best_saturated = np.argmin(np.where(finite_stack, gains[:, None], np.inf), axis=0)
+            col_idx = np.nonzero(fallback)[0]
+            combined[col_idx] = corrected_stack[best_saturated[col_idx], col_idx]
 
-        combined_corrected[replace_mask] = candidate[replace_mask]
-        remaining_mask &= candidate_saturation
-        remaining_mask &= ~replace_mask
-
-    primary_baseline = float(primary.get("baseline", 0.0))
-    if np.isfinite(primary_baseline):
-        return combined_corrected + primary_baseline
-    return combined_corrected
+    return combined

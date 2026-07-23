@@ -5,6 +5,7 @@ from __future__ import annotations
 # =====================================================================
 # IDEX Quicklook — QtAgg canvas + Matplotlib Navigation Toolbar
 # Interactive viewer with channel selection, overlays, and fit editing tools
+# Currently the TOF Combine is not working, shoulders at regions of saturation
 # =====================================================================
 
 import os
@@ -104,7 +105,11 @@ from spectrumpy_flight.mass_calibration import TOFMassCal
 from spectrumpy_flight.noise_analysis import ChannelMeta, launch_noise_analysis_window
 from spectrumpy_flight.plot_style import apply_plot_style
 from spectrumpy_flight.readTrc import Trc
-from spectrumpy_flight.tof_merge import combine_waveform_channels
+from spectrumpy_flight.tof_merge import (
+    MAX_SATURATION_GAP_US,
+    SATURATION_RELEASE_FRACTION,
+    combine_waveform_channels,
+)
 try:  # pragma: no cover - optional dependency, loaded lazily
     from spectrumpy_flight.HDF_View import launch_hdf_viewer
 except Exception:  # pragma: no cover
@@ -163,7 +168,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QFileDialog, QMainWindow, QMessageBox, QStatusBar, QToolBar,
         QVBoxLayout, QWidget, QComboBox, QLabel, QSizePolicy, QDialog, QPushButton,
-        QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
+        QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView, QFormLayout,
         QCheckBox, QDialogButtonBox, QMenu, QMenuBar, QToolButton, QTextBrowser, QTextEdit,
         QListWidget, QListWidgetItem, QLineEdit, QWidgetAction, QStyle, QSplitter,
         QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget, QProgressDialog
@@ -185,7 +190,7 @@ except Exception:
     from PyQt6.QtWidgets import (
         QApplication, QFileDialog, QMainWindow, QMessageBox, QStatusBar, QToolBar,
         QVBoxLayout, QWidget, QComboBox, QLabel, QSizePolicy, QDialog, QPushButton,
-        QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
+        QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView, QFormLayout,
         QCheckBox, QDialogButtonBox, QMenu, QMenuBar, QToolButton, QTextBrowser, QTextEdit,
         QListWidget, QListWidgetItem, QLineEdit, QWidgetAction, QStyle, QSplitter,
         QScrollArea, QFrame, QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget, QProgressDialog
@@ -1762,6 +1767,10 @@ CHANNEL_CONVERSION_FACTORS: Dict[str, float] = {
     "Target L": 1.58e1,
 }
 
+# Keep the synthetic TOF Combined trace above zero so it remains visible on
+# the default logarithmic plot scale.
+TOF_COMBINED_DISPLAY_BASELINE = 1.0
+
 CHANNEL_PLOT_COLORS: Dict[str, str] = {
     "TOF L": "#1d4ed8",
     "TOF M": "#0f766e",
@@ -2159,12 +2168,37 @@ class BaseDataSource(ABC):
 
     def __init__(self, filename: str):
         self.filename = filename
+        self._tof_max_saturation_gap_us = MAX_SATURATION_GAP_US
+        self._tof_saturation_release_fraction = SATURATION_RELEASE_FRACTION
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
     # ------------------------------------------------------------------
     def close(self) -> None:
         """Close any open resources (default: no-op)."""
+
+    def set_tof_combine_settings(
+        self,
+        *,
+        max_saturation_gap_us: Optional[float] = None,
+        saturation_release_fraction: Optional[float] = None,
+    ) -> None:
+        if max_saturation_gap_us is not None and np.isfinite(max_saturation_gap_us):
+            self._tof_max_saturation_gap_us = max(0.0, float(max_saturation_gap_us))
+        if saturation_release_fraction is not None and np.isfinite(saturation_release_fraction):
+            self._tof_saturation_release_fraction = float(saturation_release_fraction)
+
+    def _tof_combine_gap_us(self) -> float:
+        return float(getattr(self, "_tof_max_saturation_gap_us", MAX_SATURATION_GAP_US))
+
+    def _tof_combine_release_fraction(self) -> float:
+        return float(
+            getattr(
+                self,
+                "_tof_saturation_release_fraction",
+                SATURATION_RELEASE_FRACTION,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Introspection
@@ -2340,10 +2374,15 @@ class HDF5DataSource(BaseDataSource):
                 self._read_dataset(event, "TOF H"),
                 self._read_dataset(event, "TOF M"),
                 self._read_dataset(event, "TOF L"),
+                max_saturation_gap_us=self._tof_combine_gap_us(),
+                saturation_release_fraction=self._tof_combine_release_fraction(),
             )
             if combined is not None:
-                return np.asarray(combined, dtype=float)
-        return self._read_dataset(event, "Analysis/DustComposition/CombinedSignal")
+                return np.asarray(combined, dtype=float) + TOF_COMBINED_DISPLAY_BASELINE
+        stored = self._read_dataset(event, "Analysis/DustComposition/CombinedSignal")
+        if stored is not None:
+            return np.asarray(stored, dtype=float) + TOF_COMBINED_DISPLAY_BASELINE
+        return None
 
     def get_dataset(self, event: str, dataset_name: str) -> Optional[np.ndarray]:
         if dataset_name == "Analysis/DustComposition/CombinedSignal":
@@ -2862,10 +2901,12 @@ class CDFDataSource(BaseDataSource):
             self.get_dataset(event, "TOF H"),
             self.get_dataset(event, "TOF M"),
             self.get_dataset(event, "TOF L"),
+            max_saturation_gap_us=self._tof_combine_gap_us(),
+            saturation_release_fraction=self._tof_combine_release_fraction(),
         )
         if combined is None:
             return None
-        return np.asarray(combined, dtype=float)
+        return np.asarray(combined, dtype=float) + TOF_COMBINED_DISPLAY_BASELINE
 
     def _combined_time(self, event: str) -> Optional[np.ndarray]:
         values = self.get_dataset(event, "Time (high sampling)")
@@ -3467,6 +3508,25 @@ class PairedCDFDataSource(BaseDataSource):
         for source in {self._requested_source, self._paired_source}:
             try:
                 source.close()
+            except Exception:
+                pass
+
+    def set_tof_combine_settings(
+        self,
+        *,
+        max_saturation_gap_us: Optional[float] = None,
+        saturation_release_fraction: Optional[float] = None,
+    ) -> None:
+        super().set_tof_combine_settings(
+            max_saturation_gap_us=max_saturation_gap_us,
+            saturation_release_fraction=saturation_release_fraction,
+        )
+        for source in (self._requested_source, self._paired_source):
+            try:
+                source.set_tof_combine_settings(
+                    max_saturation_gap_us=max_saturation_gap_us,
+                    saturation_release_fraction=saturation_release_fraction,
+                )
             except Exception:
                 pass
 
@@ -6139,8 +6199,13 @@ class MainWindow(QMainWindow):
         self._show_mass_spectrum = False
         self._compact_plot_mode = True
         self._same_time_scale_mode = True
+        self._tof_max_saturation_gap_us = MAX_SATURATION_GAP_US
+        self._tof_saturation_release_fraction = SATURATION_RELEASE_FRACTION
         self._current_axis_count = 1
         self._plot_window_handle = None
+        self._handling_wsl_maximize = False
+        self._wsl_pseudo_maximized = False
+        self._normal_geometry_before_wsl_maximize = None
         # ``refresh_fit_controls`` is invoked as soon as data are loaded, so make
         # sure ``fit_buttons`` always exists even before the control panel is
         # constructed.  Some startup paths (for example early failures while
@@ -7123,6 +7188,38 @@ class MainWindow(QMainWindow):
         self.same_time_scale_button.toggled.connect(self._on_same_time_scale_toggled)
         control_buttons.append(self.same_time_scale_button)
 
+        tof_group = QGroupBox("TOF Combine", self)
+        tof_group.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        tof_form = QFormLayout(tof_group)
+        tof_form.setContentsMargins(8, 6, 8, 6)
+        tof_form.setHorizontalSpacing(10)
+        tof_form.setVerticalSpacing(6)
+
+        self.tof_gap_spin = QDoubleSpinBox(tof_group)
+        self.tof_gap_spin.setDecimals(2)
+        self.tof_gap_spin.setRange(0.0, 10.0)
+        self.tof_gap_spin.setSingleStep(0.05)
+        self.tof_gap_spin.setSuffix(" us")
+        self.tof_gap_spin.setValue(float(self._tof_max_saturation_gap_us))
+        self.tof_gap_spin.setToolTip(
+            "Maximum time gap to bridge when a saturation plateau briefly dips below the threshold."
+        )
+        self.tof_gap_spin.valueChanged.connect(self._on_tof_combine_settings_changed)
+
+        self.tof_hysteresis_spin = QDoubleSpinBox(tof_group)
+        self.tof_hysteresis_spin.setDecimals(3)
+        self.tof_hysteresis_spin.setRange(0.50, 1.00)
+        self.tof_hysteresis_spin.setSingleStep(0.01)
+        self.tof_hysteresis_spin.setValue(float(self._tof_saturation_release_fraction))
+        self.tof_hysteresis_spin.setToolTip(
+            "Release fraction of the 1020 DN saturation ceiling used to keep ringing traces flagged as saturated."
+        )
+        self.tof_hysteresis_spin.valueChanged.connect(self._on_tof_combine_settings_changed)
+
+        tof_form.addRow("Gap", self.tof_gap_spin)
+        tof_form.addRow("Release", self.tof_hysteresis_spin)
+        panel_layout.addWidget(tof_group)
+
         self.noise_button = QPushButton("Noise Analysis", self)
         self.noise_button.setMinimumHeight(32)
         self.noise_button.setStyleSheet(action_style)
@@ -7679,6 +7776,18 @@ class MainWindow(QMainWindow):
             return bool(button.isChecked())
         return bool(self._same_time_scale_mode)
 
+    def _tof_combine_gap_us(self) -> float:
+        spin = getattr(self, "tof_gap_spin", None)
+        if spin is not None:
+            return float(spin.value())
+        return float(self._tof_max_saturation_gap_us)
+
+    def _tof_combine_release_fraction(self) -> float:
+        spin = getattr(self, "tof_hysteresis_spin", None)
+        if spin is not None:
+            return float(spin.value())
+        return float(self._tof_saturation_release_fraction)
+
     def _plot_font_sizes(self) -> Dict[str, int]:
         if self._compact_plots_enabled():
             return {
@@ -7793,6 +7902,24 @@ class MainWindow(QMainWindow):
         self._same_time_scale_mode = bool(checked)
         self.plot_event(self._current_event)
 
+    def _on_tof_combine_settings_changed(self, *_args) -> None:
+        self._tof_max_saturation_gap_us = self._tof_combine_gap_us()
+        self._tof_saturation_release_fraction = self._tof_combine_release_fraction()
+        self._apply_tof_combine_settings()
+        self.plot_event(self._current_event)
+
+    def _apply_tof_combine_settings(self) -> None:
+        source = getattr(self, "_data_source", None)
+        if source is None:
+            return
+        try:
+            source.set_tof_combine_settings(
+                max_saturation_gap_us=self._tof_max_saturation_gap_us,
+                saturation_release_fraction=self._tof_saturation_release_fraction,
+            )
+        except Exception:
+            pass
+
     def showEvent(self, event):  # type: ignore[override]
         super().showEvent(event)
         self._bind_plot_resize_signals()
@@ -7815,6 +7942,59 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if self._compact_plots_enabled():
             QTimer.singleShot(0, self._refresh_plot_canvas_geometry)
+
+    def changeEvent(self, event):  # type: ignore[override]
+        super().changeEvent(event)
+        if event is None or event.type() != QEvent.Type.WindowStateChange:
+            return
+        if self.isMaximized() and not self.isFullScreen():
+            QTimer.singleShot(0, self._emulate_wsl_maximize)
+
+    def _emulate_wsl_maximize(self) -> None:
+        if self._handling_wsl_maximize or self.isFullScreen():
+            return
+        self._handling_wsl_maximize = True
+        try:
+            if self._wsl_pseudo_maximized and self._normal_geometry_before_wsl_maximize is not None:
+                target_geometry = self._normal_geometry_before_wsl_maximize
+                self._wsl_pseudo_maximized = False
+            else:
+                normal_geometry = self.normalGeometry()
+                self._normal_geometry_before_wsl_maximize = (
+                    normal_geometry if normal_geometry.isValid() else self.geometry()
+                )
+                target_geometry = self._screen_geometry_for_wsl_maximize()
+                self._wsl_pseudo_maximized = True
+            self.showNormal()
+            self.setMinimumSize(0, 0)
+            QTimer.singleShot(0, lambda: self._apply_wsl_pseudo_maximize_geometry(target_geometry))
+        except Exception:
+            self._handling_wsl_maximize = False
+
+    def _screen_geometry_for_wsl_maximize(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return self.geometry()
+        available = screen.availableGeometry()
+        full = screen.geometry()
+        if full.height() > available.height() * 1.2 or full.width() > available.width() * 1.2:
+            return full.adjusted(8, 8, -8, -8)
+        return available
+
+    def _apply_wsl_pseudo_maximize_geometry(self, geometry) -> None:
+        try:
+            self.setGeometry(geometry)
+            self.raise_()
+            self.activateWindow()
+            if self._compact_plots_enabled():
+                QTimer.singleShot(0, self._refresh_plot_canvas_geometry)
+        finally:
+            self._handling_wsl_maximize = False
+
+    def _apply_maximized_screen_geometry(self) -> None:
+        if not self.isMaximized() or self.isFullScreen():
+            return
+        self._emulate_wsl_maximize()
 
     def _set_stats_selector_active(self, active: bool) -> None:
         for selector in self._stats_selectors:
@@ -9006,6 +9186,7 @@ class MainWindow(QMainWindow):
 
         self._h5 = h5_handle
         self._data_source = source
+        self._apply_tof_combine_settings()
         self._filename = path
         self._paired_filename = paired_path
         self._rebuild_channel_buttons()
@@ -11614,6 +11795,25 @@ class FitParameterDialog(QDialog):
                 self.image_charge_checkbox.setChecked(not include)
 
 # --------- CLI / main ---------
+def _fit_window_to_available_screen(window: QMainWindow) -> None:
+    """Keep the main window reachable on WSLg and small displays."""
+
+    if window.isMaximized() or window.isFullScreen():
+        return
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is None:
+        return
+    available = screen.availableGeometry()
+    margin = 48
+    max_width = max(900, available.width() - margin)
+    max_height = max(640, available.height() - margin)
+    window.setMinimumSize(min(1250, max_width), min(820, max_height))
+    target_width = min(max(1250, window.width()), max_width)
+    target_height = min(max(820, window.height()), max_height)
+    window.resize(target_width, target_height)
+    window.move(available.left() + margin // 2, available.top() + margin // 2)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run the IDEX Quicklook (QtAgg + Matplotlib toolbar).")
     parser.add_argument(
@@ -11640,6 +11840,8 @@ def main():
 
     w = MainWindow(filename=args.filename, eventnumber=args.eventnumber)
     w.show()
+    QTimer.singleShot(0, lambda: _fit_window_to_available_screen(w))
+    QTimer.singleShot(250, lambda: _fit_window_to_available_screen(w))
     sys.exit(app.exec())
 
 if __name__ == "__main__":
