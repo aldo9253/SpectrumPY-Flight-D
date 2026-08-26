@@ -2943,6 +2943,10 @@ class CDFDataSource(BaseDataSource):
             trigger_counts = (int(raw_value) >> 22) & 0x3FF
         except Exception:
             return None
+        if self._product_level == "l1a":
+            # L1A contains raw waveform and trigger-register values. Keep the
+            # quicklook display in DN rather than applying an engineering-unit scale.
+            return float(trigger_counts)
         return float(scale * trigger_counts)
 
     def _channel_trigger_mode(self, event: str, channel: str) -> Optional[str]:
@@ -6199,6 +6203,7 @@ class MainWindow(QMainWindow):
         self._stats_axes: List[Any] = []
         self._show_fit: Dict[str, bool] = {name: False for name in FIT_ELIGIBLE_CHANNELS}
         self._show_mass_spectrum = False
+        self._baseline_subtraction_enabled = True
         self._compact_plot_mode = True
         self._same_time_scale_mode = True
         self._current_axis_count = 1
@@ -6311,12 +6316,6 @@ class MainWindow(QMainWindow):
 
         if filename:
             self.open_file(filename)
-        else:
-            chosen = prompt_for_data_file(self)
-            if not chosen:
-                self.close()
-                return
-            self.open_file(chosen)
 
         if eventnumber is not None and self._events and 1 <= eventnumber <= len(self._events):
             self.event_combo.setCurrentIndex(eventnumber - 1)
@@ -6381,6 +6380,11 @@ class MainWindow(QMainWindow):
                 candidate = candidate[0]
             unit = str(candidate).strip()
             if unit:
+                if (
+                    getattr(self._data_source, "_product_level", None) == "l1a"
+                    and unit.casefold() == "dn"
+                ):
+                    return "DN"
                 return unit
         return None
 
@@ -7127,6 +7131,23 @@ class MainWindow(QMainWindow):
         self.overlay_button.clicked.connect(self.on_overlay_toggled)
         control_buttons.append(self.overlay_button)
 
+        self.baseline_subtraction_button = QPushButton("Subtract Baseline", self)
+        self.baseline_subtraction_button.setCheckable(True)
+        self.baseline_subtraction_button.setChecked(self._baseline_subtraction_enabled)
+        self.baseline_subtraction_button.setMinimumHeight(0)
+        self.baseline_subtraction_button.setStyleSheet(toggle_style)
+        self.baseline_subtraction_button.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self.baseline_subtraction_button.setToolTip(
+            "Toggle automatic baseline subtraction for plotted waveforms."
+        )
+        self.baseline_subtraction_button.toggled.connect(
+            self._on_baseline_subtraction_toggled
+        )
+        fit_row_widgets.append(self.baseline_subtraction_button)
+        control_buttons.append(self.baseline_subtraction_button)
+
         self.fit_buttons: Dict[str, QPushButton] = {}
         fit_order = [channel for channel in CHANNEL_ORDER if channel in FIT_ELIGIBLE_CHANNELS]
         for channel in fit_order:
@@ -7311,7 +7332,8 @@ class MainWindow(QMainWindow):
         for name in order:
             btn = QPushButton(name, self)
             btn.setCheckable(True)
-            btn.setChecked(True if default_to_all else name in preserved_selection)
+            default_checked = default_to_all and name != "TOF Combined"
+            btn.setChecked(default_checked if default_to_all else name in preserved_selection)
             btn.setMinimumHeight(0)
             btn.setStyleSheet(toggle_style)
             btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -9135,6 +9157,10 @@ class MainWindow(QMainWindow):
     def on_overlay_toggled(self, checked: bool):
         self.plot_event(self._current_event)
 
+    def _on_baseline_subtraction_toggled(self, checked: bool) -> None:
+        self._baseline_subtraction_enabled = bool(checked)
+        self.plot_event(self._current_event)
+
     def on_fit_toggled(self, channel: str, checked: bool):
         if not self._current_event or not self._data_source:
             self._show_fit[channel] = False
@@ -9521,7 +9547,10 @@ class MainWindow(QMainWindow):
             return False
         time_data = self._get_dataset(event_name, definition.time_dataset)
         value_data = self._get_dataset(event_name, definition.dataset)
-        zero_baseline = bool(overlay_mode or channel in TOF_BASELINE_CORRECTED_CHANNELS)
+        zero_baseline = bool(
+            self._baseline_subtraction_enabled
+            and (overlay_mode or channel in TOF_BASELINE_CORRECTED_CHANNELS)
+        )
         baseline_offset = self._estimate_baseline(event_name, channel, time_data) if zero_baseline else 0.0
         waveform_color = CHANNEL_PLOT_COLORS.get(channel, "#111111")
         waveform_label = channel if overlay_mode else channel
@@ -9997,6 +10026,9 @@ class MainWindow(QMainWindow):
         channels = [ch for ch in self._channel_order() if ch in self.selected_channels and self.channel_buttons.get(ch) and self.channel_buttons[ch].isChecked()]
         parts.append("Channels: " + (", ".join(channels) if channels else "none"))
         parts.append(f"Overlay: {'ON' if self.overlay_button.isChecked() else 'OFF'}")
+        parts.append(
+            f"Baseline subtraction: {'ON' if self._baseline_subtraction_enabled else 'OFF'}"
+        )
 
         fits_on = [ch for ch, state in self._show_fit.items() if state]
         if fits_on:

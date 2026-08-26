@@ -30,16 +30,41 @@ if installed < required:
 
 require_imap_data_access_version
 
-mapfile -t remote_files < <(
+if ! query_json="$(
   imap-data-access query \
     --instrument idex \
     --data-level "$DATA_LEVEL" \
     --descriptor "$DESCRIPTOR" \
     --version latest \
     --extension cdf \
-    --output-format json \
-  | python3 -c 'import ast, sys; print("\n".join(item["file_path"] for item in ast.literal_eval(sys.stdin.read())))'
-)
+    --output-format json
+)"; then
+  echo "Unable to query the IMAP data archive." >&2
+  exit 1
+fi
+
+if ! remote_file_output="$(
+  python3 -c '
+import json
+import sys
+
+items = json.loads(sys.stdin.read())
+if not isinstance(items, list):
+    raise SystemExit("The archive query did not return a JSON list.")
+for item in items:
+    file_path = item.get("file_path")
+    if file_path:
+        print(file_path)
+' <<< "$query_json"
+)"; then
+  echo "The archive query returned invalid JSON." >&2
+  exit 1
+fi
+
+remote_files=()
+if [[ -n "$remote_file_output" ]]; then
+  mapfile -t remote_files <<< "$remote_file_output"
+fi
 
 if [[ ${#remote_files[@]} -eq 0 ]]; then
   echo "No matching $DATA_LEVEL $DESCRIPTOR files found." >&2
