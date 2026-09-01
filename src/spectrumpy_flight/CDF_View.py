@@ -91,6 +91,39 @@ def _shape_to_text(shape: Sequence[int]) -> str:
     return "×".join(str(dim) for dim in shape)
 
 
+def _attribute_text(attributes: Dict[str, object], name: str) -> Optional[str]:
+    """Return a scalar CDF attribute as text."""
+    value = attributes.get(name)
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) == 0:
+            return None
+        value = value[0]
+    return str(value) if value is not None else None
+
+
+def _format_range(values: np.ndarray, coordinate_name: Optional[str]) -> str:
+    """Format the observed coordinate range for an axis description."""
+    if coordinate_name and coordinate_name.lower() == "epoch":
+        return (
+            f"{_format_cdf_epoch(values[0])} to "
+            f"{_format_cdf_epoch(values[-1])}"
+        )
+    try:
+        numeric = np.asarray(values, dtype=float)
+        finite = numeric[np.isfinite(numeric)]
+        if len(finite):
+            return f"{finite.min():g} to {finite.max():g}"
+    except (TypeError, ValueError):
+        pass
+    return f"{_format_scalar(values[0])} to {_format_scalar(values[-1])}"
+
+
+def _format_cdf_epoch(value: object) -> str:
+    """Format a CDF TT2000 coordinate as an ISO timestamp."""
+    converted = np.asarray(cdflib.cdfepoch.to_datetime(value)).reshape(-1)[0]
+    return str(converted).replace("T", " ") + " UTC"
+
+
 class CDFViewWindow(QMainWindow):
     """Interactive viewer for browsing CDF variables and attributes."""
 
@@ -300,6 +333,8 @@ class CDFViewWindow(QMainWindow):
         except Exception as exc:
             self._data_table.setRowCount(1)
             self._data_table.setColumnCount(1)
+            self._data_table.setHorizontalHeaderLabels(["Value"])
+            self._data_table.setVerticalHeaderLabels(["0"])
             self._data_table.setItem(0, 0, QTableWidgetItem(f"Error reading data: {exc}"))
             return
 
@@ -307,9 +342,12 @@ class CDFViewWindow(QMainWindow):
         if array.ndim == 0:
             self._data_table.setRowCount(1)
             self._data_table.setColumnCount(1)
+            self._data_table.setHorizontalHeaderLabels(["Value"])
+            self._data_table.setVerticalHeaderLabels(["0"])
             self._data_table.setItem(0, 0, QTableWidgetItem(_format_scalar(array)))
             return
 
+        is_vector = array.ndim == 1
         if array.ndim == 1:
             array = array.reshape(array.shape[0], 1)
 
@@ -318,6 +356,16 @@ class CDFViewWindow(QMainWindow):
 
         self._data_table.setRowCount(rows)
         self._data_table.setColumnCount(cols)
+        axis_labels, axis_descriptions = self._axis_labels(varname, array.shape)
+        self._data_table.setHorizontalHeaderLabels(
+            ["Value"] if is_vector else axis_labels[1][:cols]
+        )
+        self._data_table.setVerticalHeaderLabels(axis_labels[0][:rows])
+        self._data_table.setToolTip("\n".join(axis_descriptions))
+        if not is_vector and len(axis_descriptions) > 1:
+            self._data_table.horizontalHeader().setToolTip(axis_descriptions[1])
+        if axis_descriptions:
+            self._data_table.verticalHeader().setToolTip(axis_descriptions[0])
         for r in range(rows):
             for c in range(cols):
                 try:
@@ -325,6 +373,72 @@ class CDFViewWindow(QMainWindow):
                 except Exception:
                     value = None
                 self._data_table.setItem(r, c, QTableWidgetItem(_format_scalar(value)))
+
+    def _axis_labels(
+        self, varname: str, shape: Sequence[int]
+    ) -> Tuple[List[List[str]], List[str]]:
+        """Build display labels for the first two preview axes from CDF metadata."""
+        attributes = self._cdf.varattsget(varname, expand=True) or {}
+        labels: List[List[str]] = []
+        descriptions: List[str] = []
+        for axis, size in enumerate(shape):
+            dependency = _attribute_text(attributes, f"DEPEND_{axis}")
+            label_pointer = _attribute_text(attributes, f"LABL_PTR_{axis}")
+            coordinate_name = dependency or (varname if len(shape) == 1 else None)
+            coordinate = None
+            coordinate_attributes: Dict[str, object] = {}
+            if coordinate_name in self._cdf_names():
+                try:
+                    coordinate = np.asarray(self._cdf.varget(coordinate_name)).reshape(-1)
+                    coordinate_attributes = self._cdf.varattsget(coordinate_name) or {}
+                except Exception:
+                    coordinate = None
+
+            label_values = None
+            if label_pointer in self._cdf_names():
+                try:
+                    label_values = np.asarray(self._cdf.varget(label_pointer)).reshape(-1)
+                except Exception:
+                    label_values = None
+
+            axis_name = _attribute_text(coordinate_attributes, "FIELDNAM") or coordinate_name
+            units = _attribute_text(coordinate_attributes, "UNITS")
+            axis_title = axis_name or f"dimension {axis}"
+            if units and units.strip():
+                axis_title += f" [{units}]"
+            description = f"Axis {axis}: {axis_title}"
+            if coordinate_name and coordinate_name != axis_name:
+                description += f" ({coordinate_name})"
+            if coordinate is not None and len(coordinate):
+                description += f"; range {_format_range(coordinate, coordinate_name)}"
+            else:
+                valid_min = _attribute_text(coordinate_attributes, "VALIDMIN")
+                valid_max = _attribute_text(coordinate_attributes, "VALIDMAX")
+                if valid_min is not None and valid_max is not None:
+                    description += f"; valid range {valid_min}–{valid_max}"
+            descriptions.append(description)
+
+            axis_values = label_values if label_values is not None else coordinate
+            axis_labels = []
+            for index in range(size):
+                if axis_values is not None and index < len(axis_values):
+                    value = axis_values[index]
+                    if coordinate_name and coordinate_name.lower() == "epoch":
+                        value_text = _format_cdf_epoch(value)
+                    else:
+                        value_text = _format_scalar(value)
+                    axis_labels.append(f"{axis_title}\n{value_text}")
+                else:
+                    axis_labels.append(f"{axis_title}\nindex {index}")
+            labels.append(axis_labels)
+        return labels, descriptions
+
+    def _cdf_names(self) -> List[str]:
+        """Return all variable names in the opened CDF."""
+        info = self._cdf.cdf_info()
+        if isinstance(info, dict):
+            return list(info.get("zVariables", [])) + list(info.get("rVariables", []))
+        return list(getattr(info, "zVariables", [])) + list(getattr(info, "rVariables", []))
 
     def _populate_attributes(self, varname: str) -> None:
         self._attr_table.clearContents()

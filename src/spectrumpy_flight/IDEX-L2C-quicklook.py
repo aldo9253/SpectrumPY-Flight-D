@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -85,6 +86,21 @@ def _array(cdf: cdflib.CDF, name: str) -> np.ndarray:
     return np.asarray(cdf.varget(name))
 
 
+def _global_text(cdf: cdflib.CDF, name: str) -> str | None:
+    value = cdf.globalattsget().get(name)
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, np.ndarray)):
+        value = value[0] if len(value) else None
+    return str(value) if value is not None else None
+
+
+def _format_epoch(value: object) -> str:
+    """Format a CDF TT2000 value as a UTC timestamp."""
+    converted = np.asarray(cdflib.cdfepoch.to_datetime(value)).reshape(-1)[0]
+    return str(converted).replace("T", " ") + " UTC"
+
+
 class L2CMapWindow(QMainWindow):
     """Window containing map selection, epoch navigation, and a Matplotlib map."""
 
@@ -95,6 +111,15 @@ class L2CMapWindow(QMainWindow):
         global_attributes = self.cdf.globalattsget()
         self.coordinate_frame = str(
             global_attributes.get("Spice_reference_frame", "unspecified")
+        )
+        self.start_date = _global_text(self.cdf, "Start_date")
+        self.impact_days = (
+            _array(self.cdf, "impact_day_of_year")
+            if "impact_day_of_year" in _cdf_names(self.cdf)
+            else None
+        )
+        self.epochs = (
+            _array(self.cdf, "epoch") if "epoch" in _cdf_names(self.cdf) else None
         )
         self.names = _cdf_names(self.cdf)
         self.map_names = [name for name in MAP_NAMES if name in self.names]
@@ -146,7 +171,41 @@ class L2CMapWindow(QMainWindow):
 
     def _populate_epochs(self) -> None:
         epoch_count = int(_array(self.cdf, self.map_names[0]).shape[0])
-        self.epoch_combo.addItems([str(index + 1) for index in range(epoch_count)])
+        labels = []
+        for index in range(epoch_count):
+            label = f"{index + 1}"
+            if self.impact_days is not None and index < len(self.impact_days):
+                label += f" (DOY {int(self.impact_days[index])})"
+            labels.append(label)
+        self.epoch_combo.addItems(labels)
+
+    def _time_description(self, epoch_index: int) -> str:
+        """Return the selected daily window and event-time centroid."""
+        parts = []
+        if self.impact_days is not None and epoch_index < len(self.impact_days):
+            day_of_year = int(self.impact_days[epoch_index])
+            year = (
+                int(self.start_date[:4])
+                if self.start_date
+                else datetime.now(timezone.utc).year
+            )
+            if self.start_date and day_of_year < datetime.strptime(
+                self.start_date, "%Y%m%d"
+            ).timetuple().tm_yday:
+                year += 1
+            window_start = datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(
+                days=day_of_year - 1
+            )
+            window_end = window_start + timedelta(days=1)
+            parts.append(
+                f"daily window: {window_start:%Y-%m-%d %H:%M}–"
+                f"{window_end:%Y-%m-%d %H:%M} UTC"
+            )
+        if self.epochs is not None and epoch_index < len(self.epochs):
+            parts.append(
+                f"event-time centroid: {_format_epoch(self.epochs[epoch_index])}"
+            )
+        return " | ".join(parts) or "time window unavailable"
 
     def _previous_epoch(self) -> None:
         self.epoch_combo.setCurrentIndex(max(0, self.epoch_combo.currentIndex() - 1))
@@ -206,14 +265,18 @@ class L2CMapWindow(QMainWindow):
         self.axes.set_xlabel("Longitude")
         self.axes.set_ylabel("Latitude")
         self.axes.set_title(
-            f"{map_name} — epoch {epoch_index + 1} — {self.coordinate_frame}"
+            f"{map_name} — epoch {epoch_index + 1} — {self.coordinate_frame}\n"
+            f"{self._time_description(epoch_index)}"
         )
         self.axes.grid(True, alpha=0.35)
-        self.colorbar = self.figure.colorbar(mesh, ax=self.axes, label=self._units(map_name))
+        self.colorbar = self.figure.colorbar(
+            mesh, ax=self.axes, label=self._units(map_name)
+        )
         self.status.setText(
             f"{self.filename.name} | {map_name} | shape {image.shape} | "
             f"displaying epoch {epoch_index + 1} of {self.epoch_combo.count()} | "
-            f"coordinate frame: {self.coordinate_frame}"
+            f"coordinate frame: {self.coordinate_frame} | "
+            f"{self._time_description(epoch_index)}"
         )
         self.canvas.draw_idle()
 
